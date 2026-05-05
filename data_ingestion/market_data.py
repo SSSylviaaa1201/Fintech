@@ -133,23 +133,32 @@ def fetch_ohlcv(
     ticker: str,
     start: str = START_DATE,
     end: Optional[str] = None,
+    prefer: str = "alpha_vantage",
 ) -> pd.DataFrame:
-    """Fetch OHLCV data with fallback chain: yfinance → Alpha Vantage → synthetic."""
+    """Fetch OHLCV data with fallback chain.
+
+    Args:
+        prefer: "alpha_vantage" (stable, API key required) or "yfinance" (unstable)
+    """
     end = end or datetime.now().strftime("%Y-%m-%d")
 
-    # 1) yfinance
-    df = _try_yfinance(ticker, start, end)
-    if df is not None and not df.empty:
-        return df
+    sources = []
+    if prefer == "alpha_vantage":
+        sources = [("Alpha Vantage", lambda: fetch_ohlcv_alpha_vantage(ticker, start, end)),
+                   ("yfinance", lambda: _try_yfinance(ticker, start, end))]
+    else:
+        sources = [("yfinance", lambda: _try_yfinance(ticker, start, end)),
+                   ("Alpha Vantage", lambda: fetch_ohlcv_alpha_vantage(ticker, start, end))]
 
-    # 2) Alpha Vantage
-    logger.info("Trying Alpha Vantage for %s...", ticker)
-    df = fetch_ohlcv_alpha_vantage(ticker, start, end)
-    if df is not None and not df.empty:
-        logger.info("Got %d rows from Alpha Vantage for %s", len(df), ticker)
-        return df
+    for name, fetcher in sources:
+        try:
+            df = fetcher()
+            if df is not None and not df.empty:
+                logger.info("Got %d rows from %s for %s", len(df), name, ticker)
+                return df
+        except Exception as e:
+            logger.warning("%s failed for %s: %s", name, ticker, e)
 
-    # 3) Synthetic fallback
     logger.warning("All sources failed for %s, using synthetic data.", ticker)
     return _generate_synthetic_ohlcv(ticker, start, end)
 

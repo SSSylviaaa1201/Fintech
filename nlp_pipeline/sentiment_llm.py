@@ -12,7 +12,7 @@ from openai import OpenAI
 
 from config import (
     VOLCANO_API_KEY, VOLCANO_BASE_URL, VOLCANO_MODEL_ID,
-    LLM_BATCH_SIZE, LLM_TEMPERATURE, LLM_ENABLED,
+    LLM_BATCH_SIZE, LLM_MAX_ARTICLES_PER_TICKER, LLM_TEMPERATURE, LLM_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,12 @@ def llm_sentiment_batch(news_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "sentiment_score", "confidence", "label", "method", "reasoning"])
 
     articles = news_df[["title", "content", "published_at"]].to_dict("records")
+
+    # Limit LLM calls per ticker to avoid hours-long runs
+    if len(articles) > LLM_MAX_ARTICLES_PER_TICKER:
+        logger.info("Limiting LLM to %d/%d articles per ticker", LLM_MAX_ARTICLES_PER_TICKER, len(articles))
+        articles = articles[:LLM_MAX_ARTICLES_PER_TICKER]
+
     all_results = []
 
     for i in range(0, len(articles), LLM_BATCH_SIZE):

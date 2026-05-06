@@ -1,5 +1,7 @@
 """APScheduler-based automated data collection for the trading platform."""
 
+from __future__ import annotations
+
 import logging
 import signal
 import sys

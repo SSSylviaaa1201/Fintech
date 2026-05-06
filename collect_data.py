@@ -13,8 +13,9 @@ import sys
 
 import config
 from data_storage.db_manager import DatabaseManager
-from data_ingestion.market_data import fetch_ohlcv, fetch_ohlcv_alpha_vantage
-from data_ingestion.news_fetcher import fetch_news_for_all_tickers, fetch_news_rss, fetch_sample_news
+from data_ingestion.market_data import fetch_ohlcv
+from data_ingestion.news_fetcher import fetch_news_for_all_tickers, fetch_sample_news
+from data_ingestion.rss_fetcher import fetch_news_rss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,15 +28,17 @@ DB = DatabaseManager()
 
 
 def collect_market(tickers: list[str]):
-    """Fetch market data for given tickers."""
-    for ticker in tickers:
-        logger.info("Fetching market data for %s...", ticker)
+    """Fetch market data for given tickers. Respects DATA_SOURCE_PRIORITY from config."""
+    from config import DATA_SOURCE_PRIORITY
 
-        # Try Alpha Vantage first (more stable)
-        df = fetch_ohlcv_alpha_vantage(ticker)
-        if df is None or df.empty:
-            logger.info("Alpha Vantage failed, trying yfinance...")
-            df = fetch_ohlcv(ticker, prefer="yfinance")
+    for i, ticker in enumerate(tickers):
+        # Respect TICKER_DELAY between tickers to avoid rate limiting
+        if i > 0:
+            import time
+            time.sleep(config.TICKER_DELAY)
+
+        logger.info("Fetching market data for %s (priority: %s)...", ticker, DATA_SOURCE_PRIORITY)
+        df = fetch_ohlcv(ticker, prefer=DATA_SOURCE_PRIORITY[0])
 
         if df is not None and not df.empty:
             new = DB.insert_market_data(ticker, df)

@@ -85,6 +85,12 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
     all_aggregated = []
 
     for ticker in config.TICKERS:
+        # Skip if sentiment already computed for this ticker
+        existing = db.get_sentiment(ticker)
+        if not existing.empty and existing["method"].nunique() >= 3:
+            logger.info("  %s: sentiment already exists (%d methods), skipping", ticker, existing["method"].nunique())
+            continue
+
         news_df = db.get_news(ticker, limit=200)
         if news_df.empty:
             logger.warning("  %s: no news, skipping", ticker)

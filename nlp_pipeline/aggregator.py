@@ -1,5 +1,7 @@
 """Aggregate daily sentiment scores per ticker from up to 4 methods with agreement metrics."""
 
+from __future__ import annotations
+
 import logging
 
 import numpy as np
@@ -22,7 +24,9 @@ def aggregate_daily_sentiment(
         return pd.DataFrame(columns=["ticker", "date", "method", "sentiment_score", "confidence", "label"])
 
     df = df.copy()
-    df["date"] = pd.to_datetime(df[date_col]).dt.date
+    df[date_col] = pd.to_datetime(df[date_col], format="mixed", utc=True)
+    df = df.dropna(subset=[date_col])
+    df["date"] = df[date_col].dt.date
 
     def agg_group(group):
         total_conf = group[confidence_col].sum()

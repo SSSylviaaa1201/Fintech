@@ -54,8 +54,13 @@ def _generate_synthetic_ohlcv(
     return df
 
 
-def fetch_ohlcv_alpha_vantage(ticker: str, start: str = "2020-01-01", end: Optional[str] = None):
-    """Fetch OHLCV from Alpha Vantage as fallback. Returns DataFrame or None."""
+def fetch_ohlcv_alpha_vantage(ticker: str, start: str = "2020-01-01", end: Optional[str] = None, outputsize: str = "compact"):
+    """Fetch OHLCV from Alpha Vantage. Returns DataFrame or None.
+
+    Args:
+        outputsize: "compact" (~100 rows, last ~5 months, free tier) or "full" (full 20-year history, premium only).
+                    Free tier: 25 requests/day.
+    """
     try:
         from alpha_vantage.timeseries import TimeSeries
     except ImportError:
@@ -72,7 +77,7 @@ def fetch_ohlcv_alpha_vantage(ticker: str, start: str = "2020-01-01", end: Optio
     for av_attempt in range(1, 4):
         try:
             ts = TimeSeries(key=key, output_format="pandas")
-            df, meta = ts.get_daily(symbol=ticker, outputsize="compact")
+            df, meta = ts.get_daily(symbol=ticker, outputsize=outputsize)
 
             df = df.reset_index()
             # Normalize column names: "1. open" → "1_open" → "open"

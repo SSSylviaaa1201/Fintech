@@ -1,5 +1,7 @@
 """ChromaDB vector store for semantic search over news articles (RAG)."""
 
+from __future__ import annotations
+
 import hashlib
 import logging
 

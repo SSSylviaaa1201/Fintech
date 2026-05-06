@@ -36,7 +36,7 @@ COLLECTION_INTERVAL_MINUTES = 60
 SCHEDULER_ENABLED = True
 
 # --- Data Sources Priority ---
-DATA_SOURCE_PRIORITY = ["alpha_vantage", "yfinance"]
+DATA_SOURCE_PRIORITY = ["yfinance", "alpha_vantage"]
 NEWS_SOURCE_PRIORITY = ["newsapi", "rss"]
 
 # --- RSS Configuration ---
@@ -55,8 +55,14 @@ VOLCANO_API_KEY = os.getenv("VOLCANO_API_KEY", "")
 VOLCANO_BASE_URL = os.getenv("VOLCANO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 VOLCANO_MODEL_ID = os.getenv("VOLCANO_MODEL_ID", "")
 LLM_BATCH_SIZE = 5
+LLM_MAX_ARTICLES_PER_TICKER = 10  # limit LLM calls per ticker (~4 min/ticker at current rate)
 LLM_TEMPERATURE = 0.1
 LLM_ENABLED = bool(VOLCANO_API_KEY and VOLCANO_MODEL_ID)
+
+# HuggingFace mirror (set via .env: HF_ENDPOINT=https://hf-mirror.com)
+HF_ENDPOINT = os.getenv("HF_ENDPOINT", "")
+if HF_ENDPOINT:
+    os.environ["HF_ENDPOINT"] = HF_ENDPOINT  # must be set before transformers import
 
 # --- RAG + Vector Store ---
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"

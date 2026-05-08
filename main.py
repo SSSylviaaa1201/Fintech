@@ -15,6 +15,7 @@ import sys
 
 import pandas as pd
 
+import numpy as np
 import config
 from data_storage.db_manager import DatabaseManager
 from utils.indicators import compute_indicators
@@ -145,6 +146,60 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
 # STEP 3: Build feature DataFrames for RL
 # ──────────────────────────────────────────────────────────────────────
 
+def _process_sentiment_signal(
+    sent_df: pd.DataFrame,
+    ema_span: int = config.SENTIMENT_EMA_SPAN,
+    neutral_threshold: float = config.SENTIMENT_NEUTRAL_THRESHOLD,
+) -> pd.Series:
+    """
+    Convert raw per-method sentiment records into a clean daily signal.
+
+    1. Consensus: weight FinBERT/LLM 2x when inter-method correlation < 0.6
+    2. EMA smoothing to reduce day-to-day noise
+    3. Neutral gating: zero out weak signals
+    """
+    if sent_df.empty:
+        return pd.Series(dtype=float)
+
+    # Pivot: dates × method
+    pivot = sent_df.pivot_table(
+        index="date", columns="method",
+        values="sentiment_score", aggfunc="mean",
+    )
+
+    if pivot.shape[1] >= 2:
+        # Inter-method correlation determines weighting strategy
+        corr = pivot.corr()
+        vals = corr.values
+        triu_idx = np.triu_indices_from(vals, k=1)
+        mean_corr = float(vals[triu_idx].mean()) if len(triu_idx[0]) > 0 else 1.0
+
+        weights = {}
+        for col in pivot.columns:
+            m = str(col).lower()
+            if m in ("finbert", "llm"):
+                weights[col] = 2.0 if mean_corr < 0.6 else 1.0
+            elif m in ("lr", "logistic_regression"):
+                weights[col] = 1.5 if mean_corr < 0.6 else 1.0
+            else:
+                weights[col] = 1.0
+
+        total_w = sum(weights.get(c, 1.0) for c in pivot.columns)
+        consensus = sum(
+            pivot[c].fillna(0.0) * weights.get(c, 1.0) for c in pivot.columns
+        ) / total_w
+    else:
+        consensus = pivot.iloc[:, 0]
+
+    # EMA smoothing
+    smoothed = consensus.ewm(span=ema_span, min_periods=1).mean()
+
+    # Neutral gating
+    smoothed = smoothed.where(smoothed.abs() >= neutral_threshold, 0.0)
+
+    return smoothed
+
+
 def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[str, pd.DataFrame]:
     """
     Build per-ticker DataFrames with columns:
@@ -164,22 +219,31 @@ def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[
         df = compute_indicators(market_df)
         df = df.reset_index(drop=True)  # ensure clean index, date as column only
 
-        # Attach sentiment if requested
+        # Attach sentiment if requested (consensus → EMA → gate)
         if with_sentiment:
             sent_df = db.get_sentiment(ticker)
             if not sent_df.empty:
-                daily_sent = sent_df.groupby("date")["sentiment_score"].mean().reset_index()
-                daily_sent = daily_sent.rename(columns={"sentiment_score": "sent"})
-                daily_sent["date"] = pd.to_datetime(daily_sent["date"])
-                df["date"] = pd.to_datetime(df["date"]).dt.date
-                daily_sent["date"] = daily_sent["date"].dt.date
-                df = df.merge(daily_sent, on="date", how="left")
-                df["sentiment_score"] = df["sent"].fillna(0.0)
-                df = df.drop(columns=["sent"])
+                signal = _process_sentiment_signal(sent_df)
+                if not signal.empty:
+                    signal_df = signal.reset_index()
+                    signal_df.columns = ["date", "sentiment_score"]
+                    signal_df["date"] = pd.to_datetime(signal_df["date"]).dt.date
+                    df["date"] = pd.to_datetime(df["date"]).dt.date
+                    df = df.merge(signal_df, on="date", how="left")
+                    df["sentiment_score"] = df["sentiment_score"].fillna(0.0)
+                else:
+                    df["sentiment_score"] = 0.0
             else:
                 df["sentiment_score"] = 0.0
         else:
             df["sentiment_score"] = 0.0
+
+        # Sentiment momentum: short-term avg and trend direction
+        df["sentiment_ma5"] = df["sentiment_score"].rolling(window=5, min_periods=1).mean()
+        df["sentiment_ma20"] = df["sentiment_score"].rolling(window=20, min_periods=1).mean()
+        df["sentiment_trend"] = df["sentiment_ma5"] - df["sentiment_ma20"]
+        # Sentiment volatility: signal reliability indicator (higher → noisier)
+        df["sentiment_vol"] = df["sentiment_score"].rolling(window=10, min_periods=1).std()
 
         # Forward-fill missing indicator values
         df = df.ffill().fillna(0.0)
@@ -253,21 +317,35 @@ def step_ablation(db: DatabaseManager) -> dict:
         df_base = compute_indicators(market_df).reset_index(drop=True)
         df_base["date"] = pd.to_datetime(df_base["date"]).dt.date
 
-        # With NLP sentiment
+        # With NLP sentiment (consensus → EMA → gate)
         sent_df = db.get_sentiment(ticker)
         if not sent_df.empty:
-            daily_sent = sent_df.groupby("date")["sentiment_score"].mean().reset_index()
-            daily_sent["date"] = pd.to_datetime(daily_sent["date"]).dt.date
-            df_with = df_base.merge(daily_sent, on="date", how="left")
+            signal = _process_sentiment_signal(sent_df)
+            if not signal.empty:
+                signal_df = signal.reset_index()
+                signal_df.columns = ["date", "sentiment_score"]
+                signal_df["date"] = pd.to_datetime(signal_df["date"]).dt.date
+                df_with = df_base.merge(signal_df, on="date", how="left")
+                df_with["sentiment_score"] = df_with["sentiment_score"].fillna(0.0)
+            else:
+                df_with = df_base.copy()
+                df_with["sentiment_score"] = 0.0
         else:
             df_with = df_base.copy()
             df_with["sentiment_score"] = 0.0
-        df_with["sentiment_score"] = df_with["sentiment_score"].fillna(0.0)
         df_with = df_with.ffill().fillna(0.0)
+        df_with["sentiment_ma5"] = df_with["sentiment_score"].rolling(window=5, min_periods=1).mean()
+        df_with["sentiment_ma20"] = df_with["sentiment_score"].rolling(window=20, min_periods=1).mean()
+        df_with["sentiment_trend"] = df_with["sentiment_ma5"] - df_with["sentiment_ma20"]
+        df_with["sentiment_vol"] = df_with["sentiment_score"].rolling(window=10, min_periods=1).std()
 
-        # Without NLP (sentiment always 0)
+        # Without NLP (sentiment always 0 → derived features also 0)
         df_without = df_base.copy()
         df_without["sentiment_score"] = 0.0
+        df_without["sentiment_ma5"] = 0.0
+        df_without["sentiment_ma20"] = 0.0
+        df_without["sentiment_trend"] = 0.0
+        df_without["sentiment_vol"] = 0.0
         df_without = df_without.ffill().fillna(0.0)
 
         logger.info("Running ablation for %s...", ticker)

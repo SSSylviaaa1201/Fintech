@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
-STATE_DIM = 8
+from config import SENTIMENT_ALIGNMENT_BONUS
+
+STATE_DIM = 11  # 8 base + sentiment_score + sentiment_ma5 + sentiment_trend + sentiment_vol
 N_ACTIONS = 3
 
 
@@ -40,6 +42,9 @@ class FinancialTradingEnv(gym.Env):
         # Ensure required columns exist
         required = ["close", "MA50", "MA200", "RSI", "MACD", "sentiment_score"]
         for col in required:
+            if col not in self.df.columns:
+                self.df[col] = 0.0
+        for col in ["sentiment_ma5", "sentiment_trend", "sentiment_vol"]:
             if col not in self.df.columns:
                 self.df[col] = 0.0
 
@@ -93,6 +98,9 @@ class FinancialTradingEnv(gym.Env):
 
         # Sentiment: already in [-1, 1]
         sentiment = float(row.get("sentiment_score", 0.0))
+        sentiment_ma5 = float(row.get("sentiment_ma5", sentiment))
+        sentiment_trend = float(row.get("sentiment_trend", 0.0))
+        sentiment_vol = float(row.get("sentiment_vol", 0.0))
 
         return np.array([
             price_ratio,
@@ -103,6 +111,9 @@ class FinancialTradingEnv(gym.Env):
             position_pct,
             cash_pct,
             sentiment,
+            sentiment_ma5,
+            sentiment_trend,
+            sentiment_vol,
         ], dtype=np.float32)
 
     def _get_price(self) -> float:
@@ -155,7 +166,17 @@ class FinancialTradingEnv(gym.Env):
         # Cash holding penalty: small cost for idle cash (~2.5% annual → per trading day)
         cash_penalty = -0.0001 if self.shares == 0 else 0.0
 
-        reward = pct_return + cash_penalty
+        # Sentiment-position alignment bonus (reward shaping)
+        sentiment = float(self.df.iloc[self.current_step].get("sentiment_score", 0.0))
+        sentiment_bonus = 0.0
+        if sentiment > 0.3 and self.shares > 0:
+            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+        elif sentiment < -0.3 and self.shares > 0:
+            sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
+        elif sentiment < -0.3 and self.shares == 0:
+            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+
+        reward = pct_return + cash_penalty + sentiment_bonus
 
         self.current_step += 1
         terminated = self.current_step >= self.n_steps - 1
@@ -168,6 +189,7 @@ class FinancialTradingEnv(gym.Env):
             "price": price,
             "trade_cost": trade_cost,
             "pct_return": pct_return,
+            "sentiment_bonus": sentiment_bonus,
         }
 
         obs = self._norm_state() if not terminated else np.zeros(STATE_DIM, dtype=np.float32)

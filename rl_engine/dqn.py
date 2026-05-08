@@ -8,10 +8,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ExponentialLR
 
 from config import (
     GAMMA, EPSILON_START, EPSILON_MIN, EPSILON_DECAY,
     LEARNING_RATE, BATCH_SIZE, TARGET_UPDATE_FREQ, MODEL_DIR, REPLAY_BUFFER_SIZE,
+    DQN_SEED,
 )
 from rl_engine.env import STATE_DIM, N_ACTIONS
 from rl_engine.replay_buffer import ReplayBuffer
@@ -66,12 +68,18 @@ class DQNAgent:
         self.target_update_freq = target_update_freq
         self.episode_count = 0
 
+        # Seed for reproducibility
+        if DQN_SEED is not None:
+            torch.manual_seed(DQN_SEED)
+            np.random.seed(DQN_SEED)
+
         self.q_network = QNetwork(state_dim, n_actions).to(_device)
         self.target_network = QNetwork(state_dim, n_actions).to(_device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.scheduler = ExponentialLR(self.optimizer, gamma=0.995)
         self.loss_fn = nn.MSELoss()
         self.replay_buffer = ReplayBuffer(replay_capacity)
 
@@ -103,9 +111,10 @@ class DQNAgent:
         # Current Q values
         current_q = self.q_network(states_t).gather(1, actions_t)
 
-        # Target Q values (detached from target network)
+        # Double DQN: q_network selects action, target_network evaluates it
         with torch.no_grad():
-            max_next_q = self.target_network(next_states_t).max(dim=1, keepdim=True).values
+            best_actions = self.q_network(next_states_t).argmax(dim=1, keepdim=True)
+            max_next_q = self.target_network(next_states_t).gather(1, best_actions)
             target_q = rewards_t + self.gamma * max_next_q * (1 - dones_t)
 
         loss = self.loss_fn(current_q, target_q)
@@ -118,9 +127,10 @@ class DQNAgent:
         return float(loss.item())
 
     def decay_epsilon(self):
-        """Per-episode epsilon decay (call after each full episode)."""
+        """Per-episode epsilon + LR decay (call after each full episode)."""
         self.episode_count += 1
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        self.scheduler.step()
 
         # Update target network per TARGET_UPDATE_FREQ episodes
         if self.episode_count % self.target_update_freq == 0:
@@ -132,6 +142,8 @@ class DQNAgent:
         torch.save({
             "q_network": self.q_network.state_dict(),
             "target_network": self.target_network.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
             "epsilon": self.epsilon,
             "episode_count": self.episode_count,
         }, p)
@@ -145,6 +157,10 @@ class DQNAgent:
         checkpoint = torch.load(p, map_location=_device)
         self.q_network.load_state_dict(checkpoint["q_network"])
         self.target_network.load_state_dict(checkpoint["target_network"])
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
         self.epsilon = checkpoint.get("epsilon", self.epsilon)
         self.episode_count = checkpoint.get("episode_count", 0)
         logger.info("Model loaded from %s", p)

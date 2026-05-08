@@ -38,7 +38,7 @@ SCHEDULER_ENABLED = True
 
 # --- Data Sources Priority ---
 DATA_SOURCE_PRIORITY = ["yahoo_direct", "yfinance", "alpha_vantage"]
-NEWS_SOURCE_PRIORITY = ["newsapi", "rss"]
+NEWS_SOURCE_PRIORITY = ["finnhub", "alphavantage_news", "newsapi", "rss"]
 
 # --- RSS Configuration ---
 RSS_ENABLED = True
@@ -82,10 +82,16 @@ LEARNING_RATE = 1e-3
 BATCH_SIZE = 64
 REPLAY_BUFFER_SIZE = 20_000
 TARGET_UPDATE_FREQ = 10
+DQN_SEED = 42  # fixed seed for reproducible training; set to None for random
 
 # Walk-forward validation
 TRAIN_SPLIT = 0.6
 VAL_SPLIT = 0.2  # remaining 0.2 is test
+
+# --- Sentiment signal processing ---
+SENTIMENT_EMA_SPAN = 5             # EMA smoothing window for daily sentiment
+SENTIMENT_NEUTRAL_THRESHOLD = 0.05  # |score| below threshold → zeroed (noise filter)
+SENTIMENT_ALIGNMENT_BONUS = 0.0002 # reward shaping bonus for sentiment-position alignment
 
 # --- SHAP Explainability ---
 SHAP_BACKGROUND_SAMPLES = 100
@@ -97,6 +103,7 @@ REFRESH_INTERVAL_SECONDS = 5
 # --- API Keys (from .env) ---
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)

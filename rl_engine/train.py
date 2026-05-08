@@ -92,6 +92,9 @@ def train_dqn(
                         ep, episodes, avg_reward, agent.epsilon)
 
     logger.info("Training complete. Best val return: %.2f", best_val_return)
+    # Load best checkpoint (not the final potentially-overfit model)
+    if best_val_return > -np.inf:
+        agent.load()
     return agent
 
 

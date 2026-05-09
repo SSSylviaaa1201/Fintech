@@ -385,14 +385,128 @@ def step_ablation(db: DatabaseManager) -> dict:
         result = run_ablation_study(df_with, df_without)
         ablation_results[ticker] = result
 
-    # Print summary
+    # ── Layer 1: Ablation Summary ──
     logger.info("\n" + "=" * 60)
-    logger.info("ABLATION STUDY SUMMARY")
+    logger.info("LAYER 1: NLP Contribution (Ablation Δ)")
     logger.info("=" * 60)
+
+    nlp_positive = 0
+    nlp_neutral = 0
+    nlp_negative = 0
     for ticker, result in ablation_results.items():
         s = result["summary"]
         logger.info("%s: Sharpe Δ=%+.4f, Return Δ=%+.4f, NLP helps=%s",
                     ticker, s["sharpe_delta"], s["return_delta"], s["nlp_improves_sharpe"])
+        if s["sharpe_delta"] > 0.01:
+            nlp_positive += 1
+        elif s["sharpe_delta"] < -0.01:
+            nlp_negative += 1
+        else:
+            nlp_neutral += 1
+
+    logger.info("NLP Positive: %d/%d (%.1f%%) | Neutral: %d | Negative: %d",
+                nlp_positive, len(ablation_results),
+                nlp_positive / len(ablation_results) * 100 if ablation_results else 0,
+                nlp_neutral, nlp_negative)
+
+    # ── Layer 2: DQN vs Buy&Hold ──
+    logger.info("\n" + "=" * 60)
+    logger.info("LAYER 2: DQN+NLP vs Buy&Hold (Absolute Performance)")
+    logger.info("=" * 60)
+
+    import config as cfg
+    sector_map = dict(zip(cfg.TICKERS, [
+        "Tech"] * 7 + ["Finance"] * 5 + ["Healthcare"] * 4 +
+        ["Consumer"] * 5 + ["Energy/Industrial"] * 5 + ["Comm/Utility"] * 2))
+
+    bh_wins_sharpe = 0
+    bh_wins_return = 0
+    sector_dqn_vs_bh = {}
+    layer2_rows = []
+
+    for ticker, result in ablation_results.items():
+        w = result["with_nlp"]
+        dqn_sharpe = w["sharpe_ratio"]
+        bh_sharpe = w["buy_and_hold_sharpe"]
+        dqn_ret = w["total_return"]
+        bh_ret = w["buy_and_hold_return"]
+        excess_sharpe = dqn_sharpe - bh_sharpe
+        excess_ret = dqn_ret - bh_ret
+
+        if excess_sharpe > 0:
+            bh_wins_sharpe += 1
+        if excess_ret > 0:
+            bh_wins_return += 1
+
+        sector = sector_map.get(ticker, "Other")
+        if sector not in sector_dqn_vs_bh:
+            sector_dqn_vs_bh[sector] = {"dqn_sharpe": [], "bh_sharpe": [], "wins": 0, "total": 0}
+        sector_dqn_vs_bh[sector]["dqn_sharpe"].append(dqn_sharpe)
+        sector_dqn_vs_bh[sector]["bh_sharpe"].append(bh_sharpe)
+        sector_dqn_vs_bh[sector]["total"] += 1
+        if excess_sharpe > 0:
+            sector_dqn_vs_bh[sector]["wins"] += 1
+
+        layer2_rows.append({
+            "ticker": ticker, "sector": sector,
+            "dqn_sharpe": dqn_sharpe, "bh_sharpe": bh_sharpe,
+            "dqn_return": dqn_ret, "bh_return": bh_ret,
+            "excess_sharpe": excess_sharpe, "excess_return": excess_ret,
+            "nlp_sharpe_delta": result["summary"]["sharpe_delta"],
+        })
+
+    logger.info("DQN beats BH on Sharpe: %d/%d (%.1f%%)",
+                bh_wins_sharpe, len(ablation_results),
+                bh_wins_sharpe / len(ablation_results) * 100 if ablation_results else 0)
+    logger.info("DQN beats BH on Return: %d/%d (%.1f%%)",
+                bh_wins_return, len(ablation_results),
+                bh_wins_return / len(ablation_results) * 100 if ablation_results else 0)
+
+    logger.info("\nBy Sector (DQN vs BH Sharpe):")
+    for sector, data in sorted(sector_dqn_vs_bh.items()):
+        avg_dqn = np.mean(data["dqn_sharpe"]) if data["dqn_sharpe"] else 0
+        avg_bh = np.mean(data["bh_sharpe"]) if data["bh_sharpe"] else 0
+        logger.info("  %s: DQN Sharpe=%.3f, BH Sharpe=%.3f, Win=%d/%d",
+                    sector, avg_dqn, avg_bh, data["wins"], data["total"])
+
+    # ── Layer 3: Paper Trading Forward Validation ──
+    logger.info("\n" + "=" * 60)
+    logger.info("LAYER 3: Paper Trading Forward Validation")
+    logger.info("=" * 60)
+
+    from paper_trader import run_paper_validation
+    paper_results = run_paper_validation(db, ablation_results)
+
+    # ── Save structured results ──
+    import json, os
+    from datetime import datetime
+    results_file = os.path.join(os.path.dirname(__file__), "data", "ablation_results.json")
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "lookback_window": cfg.LOOKBACK_WINDOW,
+            "ema_span": cfg.SENTIMENT_EMA_SPAN,
+            "neutral_threshold": cfg.SENTIMENT_NEUTRAL_THRESHOLD,
+            "episodes": cfg.EPISODES,
+        },
+        "layer1_ablation": {
+            "nlp_positive": nlp_positive,
+            "nlp_neutral": nlp_neutral,
+            "nlp_negative": nlp_negative,
+            "positive_rate": round(nlp_positive / len(ablation_results) * 100, 1) if ablation_results else 0,
+            "tickers": {t: r["summary"] for t, r in ablation_results.items()},
+        },
+        "layer2_dqn_vs_bh": {
+            "sharpe_win_rate": round(bh_wins_sharpe / len(ablation_results) * 100, 1) if ablation_results else 0,
+            "return_win_rate": round(bh_wins_return / len(ablation_results) * 100, 1) if ablation_results else 0,
+            "by_sector": {s: {"avg_dqn_sharpe": round(np.mean(d["dqn_sharpe"]), 3), "avg_bh_sharpe": round(np.mean(d["bh_sharpe"]), 3), "wins": d["wins"], "total": d["total"]} for s, d in sector_dqn_vs_bh.items()},
+            "tickers": layer2_rows,
+        },
+        "layer3_paper_trading": paper_results,
+    }
+    with open(results_file, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, default=str)
+    logger.info("Results saved to %s", results_file)
 
     return ablation_results
 

@@ -306,3 +306,62 @@ def run_paper_trading_cycle(db: DatabaseManager | None = None):
     logger.info("=" * 50)
 
     return summary
+
+
+def run_paper_validation(db: DatabaseManager, ablation_results: dict) -> dict:
+    """Post-ablation paper trading validation.
+
+    Generates forward-looking signals for all tickers using the trained model
+    and logs them as paper trade orders. Complements the backtest BH comparison
+    with an operational readiness check.
+    """
+    logger.info("Generating paper trading signals from trained model...")
+
+    buy_signals = []
+    sell_signals = []
+    hold_signals = []
+    errors = []
+
+    try:
+        trader = PaperTrader(db)
+        _ = trader.load_model()  # verify model loads
+    except FileNotFoundError:
+        logger.warning("No trained model found — skipping paper validation")
+        return {"status": "skipped", "reason": "no_model"}
+
+    for ticker in config.TICKERS:
+        try:
+            signal = trader.generate_signal(ticker)
+            trader.execute_signal(signal)
+
+            if signal["action"] == 1:
+                buy_signals.append(ticker)
+            elif signal["action"] == 2:
+                sell_signals.append(ticker)
+            else:
+                hold_signals.append(ticker)
+
+            logger.info("  %s: %s (conf=%.2f, sentiment=%.3f)",
+                        ticker, signal["label"], signal["confidence"], signal["sentiment_score"])
+        except Exception as e:
+            logger.warning("  %s: signal failed — %s", ticker, e)
+            errors.append(str(ticker))
+
+    summary = trader.get_portfolio_summary()
+
+    logger.info("Paper validation complete:")
+    logger.info("  BUY: %d (%s)", len(buy_signals), ", ".join(buy_signals[:5]) if buy_signals else "none")
+    logger.info("  SELL: %d (%s)", len(sell_signals), ", ".join(sell_signals[:5]) if sell_signals else "none")
+    logger.info("  HOLD: %d", len(hold_signals))
+    logger.info("  Portfolio: $%.2f (%+.2f%%)", summary["total_equity"], summary["total_pnl_pct"])
+
+    return {
+        "status": "completed",
+        "buy_count": len(buy_signals),
+        "sell_count": len(sell_signals),
+        "hold_count": len(hold_signals),
+        "errors": len(errors),
+        "buy_tickers": buy_signals,
+        "sell_tickers": sell_signals,
+        "portfolio_summary": summary,
+    }

@@ -31,23 +31,43 @@ def _ingest_cycle():
         logger.exception("Scheduled pipeline cycle failed")
 
 
-def start_scheduler(db: DatabaseManager | None = None):
-    """Start the background scheduler for periodic data collection."""
+def _paper_trading_cycle():
+    """Run one full paper trading cycle: ingest -> NLP -> RL inference -> execute."""
+    from paper_trader import run_paper_trading_cycle
+
+    try:
+        run_paper_trading_cycle()
+        logger.info("Scheduled paper trading cycle completed")
+    except Exception:
+        logger.exception("Scheduled paper trading cycle failed")
+
+
+def start_scheduler(db: DatabaseManager | None = None, paper_trading: bool = False):
+    """Start the background scheduler for periodic data collection.
+
+    Args:
+        db: DatabaseManager instance (created fresh if None).
+        paper_trading: If True, runs full paper trading cycle (ingest+NLP+RL+execute).
+                       If False, runs only ingest+NLP.
+    """
     global _scheduler
     if _scheduler and _scheduler.running:
         logger.warning("Scheduler already running")
         return _scheduler
 
+    cycle_fn = _paper_trading_cycle if paper_trading else _ingest_cycle
+    cycle_name = "Paper Trading (Ingest + NLP + RL + Execute)" if paper_trading else "Ingest + NLP"
+
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(
-        _ingest_cycle,
+        cycle_fn,
         trigger=IntervalTrigger(minutes=config.COLLECTION_INTERVAL_MINUTES),
         id="pipeline_cycle",
-        name="Full Pipeline Cycle (Ingest + NLP)",
+        name=cycle_name,
         replace_existing=True,
     )
     _scheduler.start()
-    logger.info("Scheduler started - pipeline runs every %d min", config.COLLECTION_INTERVAL_MINUTES)
+    logger.info("Scheduler started - %s runs every %d min", cycle_name, config.COLLECTION_INTERVAL_MINUTES)
     return _scheduler
 
 
@@ -59,21 +79,30 @@ def stop_scheduler():
         logger.info("Scheduler stopped")
 
 
-def run_once(db: DatabaseManager | None = None):
+def run_once(db: DatabaseManager | None = None, paper_trading: bool = False):
     """Manually trigger one pipeline cycle immediately."""
     db = db or DatabaseManager()
-    _ingest_cycle()
+    if paper_trading:
+        _paper_trading_cycle()
+    else:
+        _ingest_cycle()
 
 
 def main():
     """CLI entry point: start scheduler and run until interrupted."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Data scheduler for NLP-RL Platform")
+    parser.add_argument("--paper", action="store_true",
+                        help="Run full paper trading cycles (ingest+NLP+RL+execute)")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
 
-    scheduler = start_scheduler()
+    scheduler = start_scheduler(paper_trading=args.paper)
 
     def _shutdown(signum, frame):
         logger.info("Received shutdown signal...")
@@ -83,9 +112,10 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    logger.info("Data scheduler running. Press Ctrl+C to stop.")
-    logger.info("Running initial pipeline cycle...")
-    run_once()
+    mode = "Paper Trading" if args.paper else "Data Pipeline"
+    logger.info("%s scheduler running. Press Ctrl+C to stop.", mode)
+    logger.info("Running initial cycle...")
+    run_once(paper_trading=args.paper)
 
     try:
         while True:

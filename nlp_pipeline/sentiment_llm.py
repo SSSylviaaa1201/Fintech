@@ -115,10 +115,13 @@ def llm_sentiment_batch(news_df: pd.DataFrame) -> pd.DataFrame:
 
     articles = news_df[["title", "content", "published_at"]].to_dict("records")
 
-    # Limit LLM calls per ticker to avoid hours-long runs
+    # Limit LLM calls per ticker to avoid hours-long runs.
+    # Uniform sampling across the date range so LLM covers the full timeline,
+    # not just the newest 10 articles.
     if len(articles) > LLM_MAX_ARTICLES_PER_TICKER:
-        logger.info("Limiting LLM to %d/%d articles per ticker", LLM_MAX_ARTICLES_PER_TICKER, len(articles))
-        articles = articles[:LLM_MAX_ARTICLES_PER_TICKER]
+        logger.info("Limiting LLM to %d/%d articles per ticker (uniform sample)", LLM_MAX_ARTICLES_PER_TICKER, len(articles))
+        step = max(1, len(articles) // LLM_MAX_ARTICLES_PER_TICKER)
+        articles = articles[::step][:LLM_MAX_ARTICLES_PER_TICKER]
 
     all_results = []
 

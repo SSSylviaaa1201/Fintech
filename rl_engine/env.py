@@ -13,7 +13,10 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
-from config import SENTIMENT_ALIGNMENT_BONUS
+from config import (
+    SENTIMENT_ALIGNMENT_BONUS, MAX_DRAWDOWN_LIMIT, MAX_POSITION_PCT,
+    TRADE_FREQUENCY_PENALTY, CASH_PENALTY_RATE,
+)
 
 STATE_DIM = 11  # 8 base + sentiment_score + sentiment_ma5 + sentiment_trend + sentiment_vol
 N_ACTIONS = 3
@@ -69,6 +72,8 @@ class FinancialTradingEnv(gym.Env):
         self.shares = 0
         self.portfolio_value = initial_capital
         self.prev_portfolio_value = initial_capital
+        self.peak_value = initial_capital       # for max drawdown tracking
+        self.trade_count = 0                    # for trade frequency penalty
 
     def _norm_state(self) -> np.ndarray:
         """Build normalized state vector where all features are similar scale."""
@@ -102,7 +107,7 @@ class FinancialTradingEnv(gym.Env):
         sentiment_trend = float(row.get("sentiment_trend", 0.0))
         sentiment_vol = float(row.get("sentiment_vol", 0.0))
 
-        return np.array([
+        state = np.array([
             price_ratio,
             ma50_ratio,
             ma200_ratio,
@@ -116,6 +121,8 @@ class FinancialTradingEnv(gym.Env):
             sentiment_vol,
         ], dtype=np.float32)
 
+        return np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
+
     def _get_price(self) -> float:
         return float(self.df.iloc[self.current_step]["close"])
 
@@ -126,6 +133,8 @@ class FinancialTradingEnv(gym.Env):
         self.shares = 0
         self.portfolio_value = self.initial_capital
         self.prev_portfolio_value = self.initial_capital
+        self.peak_value = self.initial_capital
+        self.trade_count = 0
         return self._norm_state(), {}
 
     def step(self, action: int):
@@ -163,23 +172,45 @@ class FinancialTradingEnv(gym.Env):
         else:
             pct_return = 0.0
 
-        # Cash holding penalty: small cost for idle cash (~2.5% annual → per trading day)
-        cash_penalty = -0.0001 if self.shares == 0 else 0.0
+        # Cash holding penalty: proportional to idle cash fraction
+        position_value = self.shares * price
+        total = self.cash + position_value
+        idle_fraction = self.cash / total if total > 0 else 1.0
+        cash_penalty = -CASH_PENALTY_RATE * idle_fraction
+
+        # Position concentration penalty: discourage >MAX_POSITION_PCT in single stock
+        position_pct = position_value / total if total > 0 else 0.0
+        excess = position_pct - MAX_POSITION_PCT
+        concentration_penalty = -0.0005 * excess if excess > 0 else 0.0
+
+        # Trade frequency penalty: small cost per trade to discourage overtrading
+        made_trade = (action in (1, 2) and trade_cost > 0)
+        if made_trade:
+            self.trade_count += 1
+        frequency_penalty = -TRADE_FREQUENCY_PENALTY if made_trade else 0.0
 
         # Sentiment-position alignment bonus (reward shaping)
         sentiment = float(self.df.iloc[self.current_step].get("sentiment_score", 0.0))
         sentiment_bonus = 0.0
         if sentiment > 0.3 and self.shares > 0:
             sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+        elif sentiment > 0.3 and self.shares == 0:
+            sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS   # penalty for staying out during positive signal
         elif sentiment < -0.3 and self.shares > 0:
             sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
         elif sentiment < -0.3 and self.shares == 0:
-            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS    # reward for staying out during negative signal
 
-        reward = pct_return + cash_penalty + sentiment_bonus
+        reward = pct_return + cash_penalty + concentration_penalty + frequency_penalty + sentiment_bonus
+
+        # Max drawdown tracking and early termination
+        self.peak_value = max(self.peak_value, self.portfolio_value)
+        drawdown = (self.peak_value - self.portfolio_value) / self.peak_value if self.peak_value > 0 else 0.0
 
         self.current_step += 1
-        terminated = self.current_step >= self.n_steps - 1
+        time_terminated = self.current_step >= self.n_steps - 1
+        drawdown_terminated = drawdown > MAX_DRAWDOWN_LIMIT
+        terminated = time_terminated or drawdown_terminated
         truncated = False
 
         info = {
@@ -190,6 +221,9 @@ class FinancialTradingEnv(gym.Env):
             "trade_cost": trade_cost,
             "pct_return": pct_return,
             "sentiment_bonus": sentiment_bonus,
+            "drawdown": drawdown,
+            "trade_count": self.trade_count,
+            "drawdown_terminated": drawdown_terminated,
         }
 
         obs = self._norm_state() if not terminated else np.zeros(STATE_DIM, dtype=np.float32)

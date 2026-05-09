@@ -70,7 +70,7 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 VECTOR_STORE_TOP_K = 5
 
 # --- RL Engine ---
-LOOKBACK_WINDOW = 200
+LOOKBACK_WINDOW = 100  # shortened from 200; min 100 rows avoids alignment fallback for short-news tickers
 INITIAL_CAPITAL = 100_000.0
 TRANSACTION_COST_PCT = 0.001
 EPISODES = 200
@@ -89,9 +89,15 @@ TRAIN_SPLIT = 0.6
 VAL_SPLIT = 0.2  # remaining 0.2 is test
 
 # --- Sentiment signal processing ---
-SENTIMENT_EMA_SPAN = 5             # EMA smoothing window for daily sentiment
-SENTIMENT_NEUTRAL_THRESHOLD = 0.05  # |score| below threshold → zeroed (noise filter)
+SENTIMENT_EMA_SPAN = 2             # [P2] Light EMA smoothing
+SENTIMENT_NEUTRAL_THRESHOLD = 0.02  # [P2] Permissive gating (lower than 0.05)
 SENTIMENT_ALIGNMENT_BONUS = 0.0002 # reward shaping bonus for sentiment-position alignment
+
+# --- Risk Controls ---
+MAX_DRAWDOWN_LIMIT = 0.20        # terminate episode if drawdown exceeds 20% of peak
+MAX_POSITION_PCT = 0.25          # single stock position cap as fraction of portfolio
+TRADE_FREQUENCY_PENALTY = 0.0001 # small cost per trade to discourage overtrading
+CASH_PENALTY_RATE = 0.0001       # daily penalty per unit of idle cash (0 = binary mode)
 
 # --- SHAP Explainability ---
 SHAP_BACKGROUND_SAMPLES = 100

@@ -19,6 +19,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_gain = gain.rolling(window=14).mean()
     avg_loss = loss.rolling(window=14).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = rs.fillna(100.0)  # when avg_loss=0 (all up days), RSI → 100
     df["RSI"] = 100 - (100 / (1 + rs))
 
     # MACD

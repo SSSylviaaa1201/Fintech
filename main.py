@@ -215,12 +215,12 @@ def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[
             logger.warning("  %s: no market data, skipping", ticker)
             continue
 
-        # Align market data to news period to fix sentiment sparsity
-        sent_df = db.get_sentiment(ticker)
-        market_df = _align_market_to_news(market_df, sent_df)
-
-        # Compute technical indicators
+        # Compute technical indicators on FULL market data first (MA200 needs 200 rows)
         df = compute_indicators(market_df)
+
+        # Then align to news period
+        sent_df = db.get_sentiment(ticker)
+        df = _align_market_to_news(df, sent_df)
         df = df.reset_index(drop=True)  # ensure clean index, date as column only
 
         # Attach sentiment if requested (consensus → EMA → gate)
@@ -304,7 +304,7 @@ def step_train_evaluate(
 # ──────────────────────────────────────────────────────────────────────
 
 def _align_market_to_news(
-    market_df: pd.DataFrame, sent_df: pd.DataFrame, lookback_padding: int = 200
+    market_df: pd.DataFrame, sent_df: pd.DataFrame, lookback_padding: int = config.LOOKBACK_WINDOW
 ) -> pd.DataFrame:
     """
     Truncate market data to match news coverage period + padding for indicators.
@@ -343,11 +343,12 @@ def step_ablation(db: DatabaseManager) -> dict:
         if market_df.empty:
             continue
 
-        # Align market data to news period to fix sentiment sparsity
-        sent_df = db.get_sentiment(ticker)
-        market_df = _align_market_to_news(market_df, sent_df)
-
+        # Compute technical indicators on FULL market data first (MA200 needs 200 rows)
         df_base = compute_indicators(market_df).reset_index(drop=True)
+
+        # Then align to news period
+        sent_df = db.get_sentiment(ticker)
+        df_base = _align_market_to_news(df_base, sent_df)
         df_base["date"] = pd.to_datetime(df_base["date"]).dt.date
 
         # With NLP sentiment (consensus → EMA → gate)

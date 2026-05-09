@@ -70,8 +70,10 @@ class DQNAgent:
 
         # Seed for reproducibility
         if DQN_SEED is not None:
+            import random
             torch.manual_seed(DQN_SEED)
             np.random.seed(DQN_SEED)
+            random.seed(DQN_SEED)
 
         self.q_network = QNetwork(state_dim, n_actions).to(_device)
         self.target_network = QNetwork(state_dim, n_actions).to(_device)

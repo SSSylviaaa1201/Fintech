@@ -1,12 +1,14 @@
-"""Training loop with walk-forward validation."""
+"""Training loop with walk-forward validation and convergence analysis."""
 
+import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from config import EPISODES, TRAIN_SPLIT, VAL_SPLIT, INITIAL_CAPITAL
+from config import EPISODES, TRAIN_SPLIT, VAL_SPLIT, INITIAL_CAPITAL, DATA_DIR
 from rl_engine.dqn import DQNAgent
 from rl_engine.env import FinancialTradingEnv
 
@@ -63,11 +65,12 @@ def train_dqn(
     episodes: int = EPISODES,
     initial_capital: float = INITIAL_CAPITAL,
     agent: Optional[DQNAgent] = None,
+    seed: Optional[int] = None,
 ) -> DQNAgent:
     """Train DQN agent on training data with optional validation."""
 
     if agent is None:
-        agent = DQNAgent()
+        agent = DQNAgent(seed=seed)
 
     train_env = FinancialTradingEnv(train_df, initial_capital=initial_capital)
     val_env = FinancialTradingEnv(val_df, initial_capital=initial_capital) if val_df is not None else None
@@ -91,7 +94,27 @@ def train_dqn(
             logger.info("Episode %d/%d | avg_reward=%.2f | epsilon=%.4f",
                         ep, episodes, avg_reward, agent.epsilon)
 
+    # Convergence analysis
+    rewards = np.array(episode_rewards)
+    first_half = np.mean(rewards[:len(rewards)//2]) if len(rewards) >= 2 else 0.0
+    second_half = np.mean(rewards[len(rewards)//2:])
+    conv_ratio = second_half / max(abs(first_half), 1e-8)
+    # Linear trend slope (positive = improving)
+    x = np.arange(len(rewards))
+    slope = np.polyfit(x, rewards, 1)[0] if len(rewards) >= 2 else 0.0
+
     logger.info("Training complete. Best val return: %.2f", best_val_return)
+    logger.info("Convergence: first_half_avg=%.4f, second_half_avg=%.4f, ratio=%.2f, slope=%.6f",
+                first_half, second_half, conv_ratio, slope)
+
+    # Save training curve for report (compact)
+    try:
+        curve_path = Path(DATA_DIR) / "training_curves"
+        curve_path.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(curve_path / f"rewards.npz", rewards=rewards)
+    except Exception:
+        pass
+
     # Load best checkpoint (not the final potentially-overfit model)
     if best_val_return > -np.inf:
         agent.load()

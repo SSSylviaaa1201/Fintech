@@ -1,10 +1,14 @@
 """LLM-based sentiment analysis using Volcano Engine (Doubao) via OpenAI-compatible API.
 
 Few-shot prompt with scoring rubric for consistent, calibrated financial sentiment.
+
+NOTE: LLM is currently disabled in the main pipeline (removed from SENTIMENT_METHODS).
+This module is retained for standalone / experimental use.
 """
 
 import json
 import logging
+import time
 
 import numpy as np
 import pandas as pd
@@ -16,6 +20,9 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BASE_DELAY = 5.0  # seconds; doubles each retry (5, 10, 20)
 
 SYSTEM_PROMPT = """You are a financial sentiment analysis expert. Analyze the given news headline and content. Return a JSON object with exactly these fields:
 - "score": a float from -1.0 (very bearish) to +1.0 (very bullish), 0.0 is neutral
@@ -63,16 +70,12 @@ ANTI-MANIPULATION RULES:
 Respond ONLY with valid JSON, no markdown, no extra text."""
 
 
-def _call_llm(articles: list[dict]) -> list[dict]:
-    """Send batch of articles to LLM, return sentiment results."""
-    if not LLM_ENABLED:
-        return [_neutral_fallback(a) for a in articles]
+def _call_llm_single(client: OpenAI, article: dict, max_retries: int = LLM_MAX_RETRIES) -> dict:
+    """Call LLM for a single article with exponential backoff retry."""
+    user_content = f"Title: {article.get('title', '')}\nContent: {article.get('content', '')[:500]}"
+    last_error = None
 
-    client = OpenAI(api_key=VOLCANO_API_KEY, base_url=VOLCANO_BASE_URL)
-    results = []
-
-    for article in articles:
-        user_content = f"Title: {article.get('title', '')}\nContent: {article.get('content', '')[:500]}"
+    for attempt in range(max_retries + 1):
         try:
             resp = client.chat.completions.create(
                 model=VOLCANO_MODEL_ID,
@@ -87,15 +90,37 @@ def _call_llm(articles: list[dict]) -> list[dict]:
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
             result = json.loads(text)
-            results.append({
+            return {
                 "sentiment_score": np.clip(float(result.get("score", 0.0)), -1.0, 1.0),
                 "label": result.get("label", "neutral"),
                 "confidence": np.clip(float(result.get("confidence", 0.5)), 0.0, 1.0),
                 "reasoning": result.get("reasoning", ""),
-            })
-        except Exception:
-            logger.debug("LLM analysis failed for: %.60s...", article.get("title", ""))
-            results.append(_neutral_fallback(article))
+            }
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning("LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
+                               attempt + 1, max_retries + 1, delay, str(e)[:80])
+                time.sleep(delay)
+            else:
+                logger.warning("LLM call failed after %d retries: %.60s... → %.80s",
+                               max_retries + 1, article.get("title", ""), str(last_error)[:80])
+
+    return _neutral_fallback(article)
+
+
+def _call_llm(articles: list[dict]) -> list[dict]:
+    """Send batch of articles to LLM with per-article retry."""
+    if not LLM_ENABLED:
+        return [_neutral_fallback(a) for a in articles]
+
+    client = OpenAI(api_key=VOLCANO_API_KEY, base_url=VOLCANO_BASE_URL)
+    results = []
+
+    for article in articles:
+        result = _call_llm_single(client, article)
+        results.append(result)
 
     return results
 

@@ -188,7 +188,7 @@ def compute_consensus_score(aggregated: pd.DataFrame, agreement: dict | None = N
     """
     Compute weighted consensus score across methods.
     If high agreement: use simple mean.
-    If low agreement: weight FinBERT and LLM more heavily.
+    If low agreement: weight FinBERT more heavily.
     """
     methods = aggregated["method"].unique()
     if len(methods) <= 1:
@@ -207,7 +207,7 @@ def compute_consensus_score(aggregated: pd.DataFrame, agreement: dict | None = N
         # Low/moderate: weight sophisticated methods higher
         weights = {}
         for m in pivot.columns:
-            if m in ("finbert", "llm"):
+            if m == "finbert":
                 weights[m] = 2.0
             elif m == "lr":
                 weights[m] = 1.5
@@ -220,3 +220,103 @@ def compute_consensus_score(aggregated: pd.DataFrame, agreement: dict | None = N
     result = pd.DataFrame({"consensus_score": consensus}).reset_index()
     result["agreement_level"] = agreement.get("agreement_level", "unknown") if agreement else "unknown"
     return result
+
+
+def compute_f1_against_finbert(
+    df_vader: pd.DataFrame,
+    df_lr: pd.DataFrame,
+    df_finbert: pd.DataFrame,
+) -> dict:
+    """
+    Compute per-method F1 scores using FinBERT as pseudo-ground truth.
+
+    Converts continuous scores to binary (|score| > 0.05 → positive/negative),
+    then computes precision, recall, F1 for each method vs. FinBERT.
+    Returns dict with per-method metrics suitable for NLP quality reporting.
+    """
+    dfs = {"vader": df_vader, "lr": df_lr, "finbert": df_finbert}
+
+    # Merge all methods on date
+    merged = None
+    for method, df in dfs.items():
+        if df.empty:
+            continue
+        sub = df[["date", "sentiment_score"]].copy()
+        sub["date"] = pd.to_datetime(sub["date"]).dt.date
+        sub = sub.groupby("date")["sentiment_score"].mean().reset_index()
+        sub.columns = ["date", f"score_{method}"]
+        if merged is None:
+            merged = sub
+        else:
+            merged = merged.merge(sub, on="date", how="inner")
+
+    if merged is None or len(merged) < 10:
+        return {"error": "insufficient_data", "n_samples": len(merged) if merged is not None else 0}
+
+    def to_binary(series: pd.Series, threshold: float = 0.05) -> pd.Series:
+        """Convert scores to: 2=positive, 0=negative, 1=neutral (excluded later)."""
+        result = pd.Series(1, index=series.index)  # neutral
+        result[series > threshold] = 2              # positive
+        result[series < -threshold] = 0             # negative
+        return result
+
+    y_true = to_binary(merged["score_finbert"])
+
+    metrics = {}
+    for method in ["vader", "lr"]:
+        col = f"score_{method}"
+        if col not in merged.columns:
+            metrics[method] = {"error": "no_data"}
+            continue
+        y_pred = to_binary(merged[col])
+
+        # Exclude neutral from F1 (only evaluate directional agreement)
+        mask = (y_true != 1) & (y_pred != 1)
+        if mask.sum() < 5:
+            metrics[method] = {"error": "too_few_directional_samples", "n": int(mask.sum())}
+            continue
+
+        yt = y_true[mask]
+        yp = y_pred[mask]
+
+        # Positive class (2) metrics
+        tp_pos = int(((yt == 2) & (yp == 2)).sum())
+        fp_pos = int(((yt != 2) & (yp == 2)).sum())
+        fn_pos = int(((yt == 2) & (yp != 2)).sum())
+
+        prec_pos = tp_pos / (tp_pos + fp_pos) if (tp_pos + fp_pos) > 0 else 0.0
+        rec_pos = tp_pos / (tp_pos + fn_pos) if (tp_pos + fn_pos) > 0 else 0.0
+        f1_pos = 2 * prec_pos * rec_pos / (prec_pos + rec_pos) if (prec_pos + rec_pos) > 0 else 0.0
+
+        # Negative class (0) metrics
+        tp_neg = int(((yt == 0) & (yp == 0)).sum())
+        fp_neg = int(((yt != 0) & (yp == 0)).sum())
+        fn_neg = int(((yt == 0) & (yp != 0)).sum())
+
+        prec_neg = tp_neg / (tp_neg + fp_neg) if (tp_neg + fp_neg) > 0 else 0.0
+        rec_neg = tp_neg / (tp_neg + fn_neg) if (tp_neg + fn_neg) > 0 else 0.0
+        f1_neg = 2 * prec_neg * rec_neg / (prec_neg + rec_neg) if (prec_neg + rec_neg) > 0 else 0.0
+
+        # Macro F1
+        f1_macro = (f1_pos + f1_neg) / 2.0
+
+        metrics[method] = {
+            "f1_macro": round(f1_macro, 4),
+            "f1_positive": round(f1_pos, 4),
+            "f1_negative": round(f1_neg, 4),
+            "precision_macro": round((prec_pos + prec_neg) / 2, 4),
+            "recall_macro": round((rec_pos + rec_neg) / 2, 4),
+            "n_samples": int(mask.sum()),
+        }
+
+    # Overall agreement rate (including neutrals)
+    total = len(merged)
+    if total > 0:
+        for method in ["vader", "lr"]:
+            col = f"score_{method}"
+            if col in merged.columns and method in metrics and "error" not in metrics[method]:
+                yp_all = to_binary(merged[col])
+                agreement = int((y_true == yp_all).sum())
+                metrics[method]["agreement_rate"] = round(agreement / total, 4)
+
+    return metrics

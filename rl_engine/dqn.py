@@ -57,6 +57,7 @@ class DQNAgent:
         batch_size: int = BATCH_SIZE,
         target_update_freq: int = TARGET_UPDATE_FREQ,
         replay_capacity: int = REPLAY_BUFFER_SIZE,
+        seed: Optional[int] = None,
     ):
         self.state_dim = state_dim
         self.n_actions = n_actions
@@ -68,12 +69,13 @@ class DQNAgent:
         self.target_update_freq = target_update_freq
         self.episode_count = 0
 
-        # Seed for reproducibility
-        if DQN_SEED is not None:
+        # Seed: explicit arg > config DQN_SEED > no seeding
+        _seed = seed if seed is not None else DQN_SEED
+        if _seed is not None:
             import random
-            torch.manual_seed(DQN_SEED)
-            np.random.seed(DQN_SEED)
-            random.seed(DQN_SEED)
+            torch.manual_seed(_seed)
+            np.random.seed(_seed)
+            random.seed(_seed)
 
         self.q_network = QNetwork(state_dim, n_actions).to(_device)
         self.target_network = QNetwork(state_dim, n_actions).to(_device)
@@ -84,6 +86,7 @@ class DQNAgent:
         self.scheduler = ExponentialLR(self.optimizer, gamma=0.995)
         self.loss_fn = nn.MSELoss()
         self.replay_buffer = ReplayBuffer(replay_capacity)
+        self._opt_stepped = False  # track first optimizer.step() for scheduler ordering
 
     def select_action(self, state: np.ndarray, evaluate: bool = False) -> int:
         """Epsilon-greedy action selection."""
@@ -125,6 +128,7 @@ class DQNAgent:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
         self.optimizer.step()
+        self._opt_stepped = True
 
         return float(loss.item())
 
@@ -132,7 +136,8 @@ class DQNAgent:
         """Per-episode epsilon + LR decay (call after each full episode)."""
         self.episode_count += 1
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        self.scheduler.step()
+        if self._opt_stepped:  # only step scheduler after at least one optimizer.step()
+            self.scheduler.step()
 
         # Update target network per TARGET_UPDATE_FREQ episodes
         if self.episode_count % self.target_update_freq == 0:

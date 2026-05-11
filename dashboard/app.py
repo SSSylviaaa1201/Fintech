@@ -417,7 +417,7 @@ st.markdown(f"""
         <span style="color:#64748b;font-size:13px;font-weight:400;">v2.0</span>
     </div>
     <div style="display:flex;gap:24px;font-size:12px;color:#64748b;align-items:center;">
-        <span>◆ DQN + FinBERT + LLM</span>
+        <span>◆ DQN + FinBERT (3-method NLP)</span>
         <span class="status-pulse" style="color:{'#22c55e' if has_logs else '#fbbf24'};">
             {'● Live' if has_logs else '○ Standby'}
         </span>

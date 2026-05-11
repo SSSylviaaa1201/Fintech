@@ -49,7 +49,7 @@ RSS_REQUEST_DELAY = 1
 # --- NLP Pipeline ---
 FINBERT_MODEL = "ProsusAI/finbert"
 MAX_SEQ_LENGTH = 512
-SENTIMENT_METHODS = ["vader", "logistic_regression", "finbert", "llm"]
+SENTIMENT_METHODS = ["vader", "lr", "finbert"]
 
 # --- LLM (Volcano Engine / Doubao) ---
 VOLCANO_API_KEY = os.getenv("VOLCANO_API_KEY", "")
@@ -82,7 +82,11 @@ LEARNING_RATE = 1e-3
 BATCH_SIZE = 64
 REPLAY_BUFFER_SIZE = 20_000
 TARGET_UPDATE_FREQ = 10
-DQN_SEED = 42  # fixed seed for reproducible training; set to None for random
+DQN_SEED = 42  # default seed for reproducible training; set to None for random
+DQN_SEEDS = [42, 123, 456]  # multiple seeds for variance quantification (ablation mode)
+
+# Ablation multi-seed (set True to quantify DQN training variance; adds ~3× runtime)
+ABLATION_MULTI_SEED = False
 
 # Walk-forward validation
 TRAIN_SPLIT = 0.6

@@ -70,7 +70,7 @@ def step_ingest(db: DatabaseManager) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 def step_nlp(db: DatabaseManager) -> pd.DataFrame:
-    """Run all 4 sentiment methods on stored news, write sentiment to DB."""
+    """Run 3 sentiment methods (VADER, LR, FinBERT) on stored news, write to DB."""
     logger.info("=" * 60)
     logger.info("STEP 2: NLP Sentiment Pipeline")
     logger.info("=" * 60)
@@ -79,20 +79,21 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
     from nlp_pipeline.sentiment_lexicon import vader_sentiment_batch
     from nlp_pipeline.sentiment_lr import lr_sentiment_batch
     from nlp_pipeline.sentiment_finbert import finbert_sentiment_batch
-    from nlp_pipeline.sentiment_llm import llm_sentiment_batch
-    from nlp_pipeline.aggregator import get_merged_sentiment
+    from nlp_pipeline.aggregator import get_merged_sentiment, compute_f1_against_finbert
     from vector_store.chroma_store import index_news
 
     all_aggregated = []
 
     for ticker in config.TICKERS:
-        # Skip if sentiment already computed for this ticker
+        # Skip if sentiment already computed with current method set
         existing = db.get_sentiment(ticker)
-        if not existing.empty and existing["method"].nunique() >= 3:
-            logger.info("  %s: sentiment already exists (%d methods), skipping", ticker, existing["method"].nunique())
+        current_methods = set(config.SENTIMENT_METHODS)
+        existing_methods = set(existing["method"].unique()) if not existing.empty else set()
+        if existing_methods == current_methods:
+            logger.info("  %s: sentiment already exists (%d methods), skipping", ticker, len(existing_methods))
             continue
 
-        news_df = db.get_news(ticker, limit=2000)  # process all available news, not just 200
+        news_df = db.get_news(ticker, limit=2000)
         if news_df.empty:
             logger.warning("  %s: no news, skipping", ticker)
             continue
@@ -112,12 +113,8 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
         logger.info("    - FinBERT sentiment...")
         df_finbert = finbert_sentiment_batch(news_df)
 
-        # 4) LLM (Volcano Engine)
-        logger.info("    - LLM sentiment...")
-        df_llm = llm_sentiment_batch(news_df)
-
         # Merge and aggregate to daily
-        result = get_merged_sentiment(df_vader, df_lr, df_finbert, df_llm)
+        result = get_merged_sentiment(df_vader, df_lr, df_finbert)
         aggregated = result["aggregated"]
         all_aggregated.append(aggregated)
 
@@ -125,6 +122,18 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
         if result.get("agreement"):
             ag = result["agreement"]
             logger.info("    Agreement: kappa=%s, level=%s", ag.get("kappa"), ag.get("agreement_level"))
+
+        # F1 scores (VADER & LR vs FinBERT as pseudo-ground-truth)
+        try:
+            f1_metrics = compute_f1_against_finbert(df_vader, df_lr, df_finbert)
+            for method in ["vader", "lr"]:
+                m = f1_metrics.get(method, {})
+                if "error" not in m:
+                    logger.info("    F1 %s: macro=%.3f, pos=%.3f, neg=%.3f (n=%d)",
+                                method.upper(), m["f1_macro"], m["f1_positive"],
+                                m["f1_negative"], m.get("n_samples", 0))
+        except Exception:
+            logger.debug("F1 computation skipped for %s", ticker)
 
         # Store in DB
         records = aggregated.to_dict("records")
@@ -154,7 +163,7 @@ def _process_sentiment_signal(
     """
     Convert raw per-method sentiment records into a clean daily signal.
 
-    1. Consensus: weight FinBERT/LLM 2x when inter-method correlation < 0.6
+    1. Consensus: weight FinBERT 2x when inter-method correlation < 0.6
     2. EMA smoothing to reduce day-to-day noise
     3. Neutral gating: zero out weak signals
     """
@@ -177,7 +186,7 @@ def _process_sentiment_signal(
         weights = {}
         for col in pivot.columns:
             m = str(col).lower()
-            if m in ("finbert", "llm"):
+            if m == "finbert":
                 weights[col] = 2.0 if mean_corr < 0.6 else 1.0
             elif m in ("lr", "logistic_regression"):
                 weights[col] = 1.5 if mean_corr < 0.6 else 1.0
@@ -381,9 +390,21 @@ def step_ablation(db: DatabaseManager) -> dict:
         df_without["sentiment_vol"] = 0.0
         df_without = df_without.ffill().fillna(0.0)
 
-        logger.info("Running ablation for %s...", ticker)
-        result = run_ablation_study(df_with, df_without)
+        seeds = config.DQN_SEEDS if config.ABLATION_MULTI_SEED else None
+        logger.info("Running ablation for %s... (seeds=%s)", ticker, seeds)
+        result = run_ablation_study(df_with, df_without, seeds=seeds)
         ablation_results[ticker] = result
+
+    # ── Layer 0: Seed Variance (only when multi-seed enabled) ──
+    if config.ABLATION_MULTI_SEED:
+        logger.info("\n" + "=" * 60)
+        logger.info("LAYER 0: DQN Training Variance (multi-seed)")
+        logger.info("=" * 60)
+        for ticker, result in ablation_results.items():
+            with_std = result["with_nlp"]["seed_std"]["sharpe_ratio"]
+            without_std = result["without_nlp"]["seed_std"]["sharpe_ratio"]
+            logger.info("%s: with-NLP Sharpe σ=%.4f | without-NLP Sharpe σ=%.4f",
+                        ticker, with_std, without_std)
 
     # ── Layer 1: Ablation Summary ──
     logger.info("\n" + "=" * 60)
@@ -395,8 +416,9 @@ def step_ablation(db: DatabaseManager) -> dict:
     nlp_negative = 0
     for ticker, result in ablation_results.items():
         s = result["summary"]
-        logger.info("%s: Sharpe Δ=%+.4f, Return Δ=%+.4f, NLP helps=%s",
-                    ticker, s["sharpe_delta"], s["return_delta"], s["nlp_improves_sharpe"])
+        std_info = f"±{s.get('sharpe_delta_std', 0):.4f}" if s.get('sharpe_delta_std', 0) > 0 else ""
+        logger.info("%s: Sharpe Δ=%+.4f%s, Return Δ=%+.4f, NLP helps=%s",
+                    ticker, s["sharpe_delta"], std_info, s["return_delta"], s["nlp_improves_sharpe"])
         if s["sharpe_delta"] > 0.01:
             nlp_positive += 1
         elif s["sharpe_delta"] < -0.01:

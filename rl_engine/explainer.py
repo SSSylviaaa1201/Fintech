@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 STATE_FEATURE_NAMES = [
     "price_ratio", "MA50_ratio", "MA200_ratio", "RSI_norm",
     "MACD_ratio", "position_pct", "cash_pct", "sentiment_score",
+    "sentiment_ma5", "sentiment_trend", "sentiment_vol",
 ]
 
 

@@ -45,20 +45,21 @@ def train_agent_for_ticker(db: DatabaseManager, ticker: str) -> tuple[DQNAgent, 
             signal_df = signal.reset_index()
             signal_df.columns = ["date", "sentiment_score"]
             signal_df["date"] = pd.to_datetime(signal_df["date"]).dt.date
-            df_with = df_base.merge(signal_df, on=["ticker", "date"], how="left")
+            df_with = df_base.merge(signal_df, on="date", how="left")
+            df_with["sentiment_score"] = df_with["sentiment_score"].fillna(0.0)
         else:
             df_with = df_base.copy()
             df_with["sentiment_score"] = 0.0
     else:
         df_with = df_base.copy()
         df_with["sentiment_score"] = 0.0
+    df_with = df_with.ffill().fillna(0.0)
 
     # Add derived sentiment features
-    df_with["sentiment_ma5"] = df_with["sentiment_score"].rolling(5).mean()
-    df_with["sentiment_ma20"] = df_with["sentiment_score"].rolling(20).mean()
+    df_with["sentiment_ma5"] = df_with["sentiment_score"].rolling(window=5, min_periods=1).mean()
+    df_with["sentiment_ma20"] = df_with["sentiment_score"].rolling(window=20, min_periods=1).mean()
     df_with["sentiment_trend"] = df_with["sentiment_ma5"] - df_with["sentiment_ma20"]
-    df_with["sentiment_vol"] = df_with["sentiment_score"].rolling(10).std()
-    df_with = df_with.ffill().fillna(0.0)
+    df_with["sentiment_vol"] = df_with["sentiment_score"].rolling(window=10, min_periods=1).std()
 
     train_df, val_df, test_df = walk_forward_split(df_with)
     agent = DQNAgent()

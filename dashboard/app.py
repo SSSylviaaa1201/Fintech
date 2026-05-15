@@ -307,9 +307,9 @@ with st.sidebar:
     # Quick ticker buttons
     for t in watchlist[:12]:
         is_active = t == ticker
-        indicator = '<span style="color:#38bdf8;margin-right:6px;">●</span>' if is_active else '<span style="color:#334155;margin-right:6px;">○</span>'
+        indicator = "🔹 " if is_active else "▫️ "
         if st.button(
-            f"{indicator} {t}", key=f"wl_{t}",
+            f"{indicator}{t}", key=f"wl_{t}",
             use_container_width=True,
         ):
             st.session_state.current_ticker = t

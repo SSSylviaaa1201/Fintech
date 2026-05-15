@@ -231,6 +231,15 @@ if "current_ticker" not in st.session_state:
 if "rss_cache" not in st.session_state:
     st.session_state.rss_cache = {}
 
+# Handle URL query param: ?ticker=XXX for watchlist dot clicks
+query_params = st.query_params
+if "ticker" in query_params:
+    url_ticker = query_params["ticker"].upper()
+    if url_ticker in TICKERS:
+        st.session_state.current_ticker = url_ticker
+        # Clear query params to avoid sticky selection
+        st.query_params.clear()
+
 ticker = st.session_state.current_ticker
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -304,17 +313,31 @@ with st.sidebar:
     if watchlist:
         st.session_state.watchlist = watchlist
 
-    # Quick ticker buttons
-    for t in watchlist[:12]:
+    # Quick ticker buttons — HTML styled with colored dots
+    cols = st.columns(min(len(watchlist[:12]), 3) if len(watchlist[:12]) > 1 else 1)
+    for i, t in enumerate(watchlist[:12]):
         is_active = t == ticker
-        indicator = "🔹 " if is_active else "▫️ "
-        if st.button(
-            f"{indicator}{t}", key=f"wl_{t}",
-            use_container_width=True,
-        ):
-            st.session_state.current_ticker = t
-            st.cache_data.clear()
-            st.rerun()
+        dot_color = "#38bdf8" if is_active else "#475569"
+        dot_glow = "0 0 8px rgba(56,189,248,0.5)" if is_active else "none"
+        with cols[i % len(cols)]:
+            st.markdown(f"""
+            <a href="?ticker={t}" style="text-decoration:none;display:block;">
+            <div style="
+                display:flex;align-items:center;gap:6px;
+                padding:8px 10px;border-radius:8px;margin-bottom:6px;
+                border:1px solid {'rgba(56,189,248,0.4)' if is_active else 'rgba(71,85,105,0.3)'};
+                background:{'rgba(56,189,248,0.1)' if is_active else 'rgba(15,23,42,0.6)'};
+                transition:all 0.2s;
+            ">
+                <span style="
+                    width:8px;height:8px;border-radius:50%;
+                    background:{dot_color};box-shadow:{dot_glow};
+                    flex-shrink:0;
+                "></span>
+                <span style="color:{'#e2e8f0' if is_active else '#94a3b8'};font-size:13px;font-weight:{'600' if is_active else '400'};">{t}</span>
+            </div>
+            </a>
+            """, unsafe_allow_html=True)
 
     st.markdown("---")
 

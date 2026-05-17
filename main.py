@@ -12,6 +12,7 @@ Usage:
 import argparse
 import logging
 import sys
+from typing import Optional
 
 import pandas as pd
 
@@ -267,6 +268,41 @@ def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _prepare_log_records(log_df: pd.DataFrame, ticker: str, episode: int = 1) -> list[dict]:
+    """Convert evaluate_agent log_df to insert_trading_log-compatible records."""
+    action_map = {0: "hold", 1: "buy", 2: "sell"}
+    records = []
+    for _, row in log_df.iterrows():
+        date_val = row.get("date", None)
+        if isinstance(date_val, pd.Timestamp):
+            date_val = date_val.strftime("%Y-%m-%d")
+        elif date_val is not None:
+            date_val = str(date_val)
+
+        action_val = row.get("action", 0)
+        if isinstance(action_val, (int, float)):
+            action_val = action_map.get(int(action_val), "hold")
+
+        records.append({
+            "episode": int(row.get("episode", episode)),
+            "step": int(row.get("step", 0)),
+            "ticker": str(row.get("ticker", ticker)),
+            "date": date_val,
+            "action": action_val,
+            "price": float(row.get("price", 0)),
+            "position": int(row.get("shares", 0)),
+            "cash": float(row.get("cash", 0)),
+            "portfolio_value": float(row.get("portfolio_value", 0)),
+            "sentiment_score": float(row.get("sentiment_score", 0)),
+            "reward": float(row.get("reward", 0)),
+        })
+    return records
+
+
+# ──────────────────────────────────────────────────────────────────────
 # STEP 4: Train & Evaluate
 # ──────────────────────────────────────────────────────────────────────
 
@@ -274,6 +310,7 @@ def step_train_evaluate(
     feature_dfs: dict[str, pd.DataFrame],
     episodes: int = config.EPISODES,
     label: str = "",
+    db: Optional[DatabaseManager] = None,
 ) -> dict:
     """Train DQN and backtest for each ticker."""
     logger.info("=" * 60)
@@ -293,13 +330,19 @@ def step_train_evaluate(
 
         # Train
         logger.info("  Training DQN (%d episodes)...", episodes)
-        agent = train_dqn(train_df, val_df, episodes=episodes)
+        agent = train_dqn(train_df, val_df, episodes=episodes, ticker=ticker)
 
         # Backtest
         logger.info("  Backtesting...")
-        metrics = backtest(agent, test_df)
+        metrics = backtest(agent, test_df, episode=1, ticker=ticker)
         metrics["ticker"] = ticker
         results[ticker] = metrics
+
+        # Persist trading logs for dashboard
+        if db is not None and not metrics["log_df"].empty:
+            log_records = _prepare_log_records(metrics["log_df"], ticker, episode=1)
+            db.insert_trading_log(log_records)
+            logger.info("  Saved %d trading log rows for %s", len(log_records), ticker)
 
         logger.info("  %s: Sharpe=%.4f, MDD=%.4f, Return=%.4f, BH Return=%.4f",
                     ticker, metrics["sharpe_ratio"], metrics["max_drawdown"],
@@ -392,8 +435,19 @@ def step_ablation(db: DatabaseManager) -> dict:
 
         seeds = config.DQN_SEEDS if config.ABLATION_MULTI_SEED else None
         logger.info("Running ablation for %s... (seeds=%s)", ticker, seeds)
-        result = run_ablation_study(df_with, df_without, seeds=seeds, episodes=config.EPISODES)
+        result = run_ablation_study(df_with, df_without, seeds=seeds,
+                                    episodes=config.EPISODES, ticker=ticker)
         ablation_results[ticker] = result
+
+        # Persist trading logs from ablation (best seed for each condition)
+        for condition in ["with_nlp", "without_nlp"]:
+            if "seed_details" in result[condition]:
+                for ep, detail in enumerate(result[condition]["seed_details"], 1):
+                    if "log_df" in detail and not detail["log_df"].empty:
+                        log_records = _prepare_log_records(detail["log_df"], ticker, episode=ep)
+                        db.insert_trading_log(log_records)
+                        logger.info("  Saved %d ablation log rows for %s (%s, ep=%d)",
+                                    len(log_records), ticker, condition, ep)
 
     # ── Layer 0: Seed Variance (only when multi-seed enabled) ──
     if config.ABLATION_MULTI_SEED:
@@ -414,22 +468,26 @@ def step_ablation(db: DatabaseManager) -> dict:
     nlp_positive = 0
     nlp_neutral = 0
     nlp_negative = 0
+    nlp_mdd_improved = 0
     for ticker, result in ablation_results.items():
         s = result["summary"]
         std_info = f"±{s.get('sharpe_delta_std', 0):.4f}" if s.get('sharpe_delta_std', 0) > 0 else ""
-        logger.info("%s: Sharpe Δ=%+.4f%s, Return Δ=%+.4f, NLP helps=%s",
-                    ticker, s["sharpe_delta"], std_info, s["return_delta"], s["nlp_improves_sharpe"])
+        logger.info("%s: Sharpe Δ=%+.4f%s, Return Δ=%+.4f, MDD Δ=%+.4f, NLP helps=%s",
+                    ticker, s["sharpe_delta"], std_info,
+                    s["return_delta"], s.get("mdd_delta", 0), s["nlp_improves_sharpe"])
         if s["sharpe_delta"] > 0.01:
             nlp_positive += 1
         elif s["sharpe_delta"] < -0.01:
             nlp_negative += 1
         else:
             nlp_neutral += 1
+        if s.get("mdd_delta", 0) > 0:
+            nlp_mdd_improved += 1
 
-    logger.info("NLP Positive: %d/%d (%.1f%%) | Neutral: %d | Negative: %d",
+    logger.info("NLP Positive: %d/%d (%.1f%%) | Neutral: %d | Negative: %d | MDD Improved: %d",
                 nlp_positive, len(ablation_results),
                 nlp_positive / len(ablation_results) * 100 if ablation_results else 0,
-                nlp_neutral, nlp_negative)
+                nlp_neutral, nlp_negative, nlp_mdd_improved)
 
     # ── Layer 2: DQN vs Buy&Hold ──
     logger.info("\n" + "=" * 60)
@@ -460,11 +518,16 @@ def step_ablation(db: DatabaseManager) -> dict:
         if excess_ret > 0:
             bh_wins_return += 1
 
+        dqn_mdd = w["max_drawdown"]
+        bh_mdd = w["buy_and_hold_mdd"]
+
         sector = sector_map.get(ticker, "Other")
         if sector not in sector_dqn_vs_bh:
-            sector_dqn_vs_bh[sector] = {"dqn_sharpe": [], "bh_sharpe": [], "wins": 0, "total": 0}
+            sector_dqn_vs_bh[sector] = {"dqn_sharpe": [], "bh_sharpe": [], "dqn_mdd": [], "bh_mdd": [], "wins": 0, "total": 0}
         sector_dqn_vs_bh[sector]["dqn_sharpe"].append(dqn_sharpe)
         sector_dqn_vs_bh[sector]["bh_sharpe"].append(bh_sharpe)
+        sector_dqn_vs_bh[sector]["dqn_mdd"].append(dqn_mdd)
+        sector_dqn_vs_bh[sector]["bh_mdd"].append(bh_mdd)
         sector_dqn_vs_bh[sector]["total"] += 1
         if excess_sharpe > 0:
             sector_dqn_vs_bh[sector]["wins"] += 1
@@ -472,6 +535,7 @@ def step_ablation(db: DatabaseManager) -> dict:
         layer2_rows.append({
             "ticker": ticker, "sector": sector,
             "dqn_sharpe": dqn_sharpe, "bh_sharpe": bh_sharpe,
+            "dqn_mdd": dqn_mdd, "bh_mdd": bh_mdd,
             "dqn_return": dqn_ret, "bh_return": bh_ret,
             "excess_sharpe": excess_sharpe, "excess_return": excess_ret,
             "nlp_sharpe_delta": result["summary"]["sharpe_delta"],
@@ -488,8 +552,10 @@ def step_ablation(db: DatabaseManager) -> dict:
     for sector, data in sorted(sector_dqn_vs_bh.items()):
         avg_dqn = np.mean(data["dqn_sharpe"]) if data["dqn_sharpe"] else 0
         avg_bh = np.mean(data["bh_sharpe"]) if data["bh_sharpe"] else 0
-        logger.info("  %s: DQN Sharpe=%.3f, BH Sharpe=%.3f, Win=%d/%d",
-                    sector, avg_dqn, avg_bh, data["wins"], data["total"])
+        avg_dqn_mdd = np.mean(data["dqn_mdd"]) if data["dqn_mdd"] else 0
+        avg_bh_mdd = np.mean(data["bh_mdd"]) if data["bh_mdd"] else 0
+        logger.info("  %s: DQN Sharpe=%.3f, BH Sharpe=%.3f, DQN MDD=%.3f, BH MDD=%.3f, Win=%d/%d",
+                    sector, avg_dqn, avg_bh, avg_dqn_mdd, avg_bh_mdd, data["wins"], data["total"])
 
     # ── Layer 3: Paper Trading Forward Validation ──
     logger.info("\n" + "=" * 60)
@@ -515,13 +581,14 @@ def step_ablation(db: DatabaseManager) -> dict:
             "nlp_positive": nlp_positive,
             "nlp_neutral": nlp_neutral,
             "nlp_negative": nlp_negative,
+            "nlp_mdd_improved": nlp_mdd_improved,
             "positive_rate": round(nlp_positive / len(ablation_results) * 100, 1) if ablation_results else 0,
             "tickers": {t: r["summary"] for t, r in ablation_results.items()},
         },
         "layer2_dqn_vs_bh": {
             "sharpe_win_rate": round(bh_wins_sharpe / len(ablation_results) * 100, 1) if ablation_results else 0,
             "return_win_rate": round(bh_wins_return / len(ablation_results) * 100, 1) if ablation_results else 0,
-            "by_sector": {s: {"avg_dqn_sharpe": round(np.mean(d["dqn_sharpe"]), 3), "avg_bh_sharpe": round(np.mean(d["bh_sharpe"]), 3), "wins": d["wins"], "total": d["total"]} for s, d in sector_dqn_vs_bh.items()},
+            "by_sector": {s: {"avg_dqn_sharpe": round(np.mean(d["dqn_sharpe"]), 3), "avg_bh_sharpe": round(np.mean(d["bh_sharpe"]), 3), "avg_dqn_mdd": round(np.mean(d["dqn_mdd"]), 4) if d.get("dqn_mdd") else None, "avg_bh_mdd": round(np.mean(d["bh_mdd"]), 4) if d.get("bh_mdd") else None, "wins": d["wins"], "total": d["total"]} for s, d in sector_dqn_vs_bh.items()},
             "tickers": layer2_rows,
         },
         "layer3_paper_trading": paper_results,
@@ -574,7 +641,7 @@ def main():
         feature_dfs = build_rl_features(db, with_sentiment=True)
 
         # Train & evaluate
-        results = step_train_evaluate(feature_dfs, episodes=config.EPISODES, label="[with NLP]")
+        results = step_train_evaluate(feature_dfs, episodes=config.EPISODES, label="[with NLP]", db=db)
 
         # Print final results
         logger.info("\n" + "=" * 60)

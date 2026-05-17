@@ -120,18 +120,125 @@ def create_sentiment_quad(sentiment_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_heatmap(pct_changes: dict[str, float]) -> go.Figure:
-    """Multi-ticker heatmap: bar chart of daily % changes."""
-    symbols = list(pct_changes.keys())
-    values = list(pct_changes.values())
-    colors = [COLORS["up"] if v >= 0 else COLORS["down"] for v in values]
+def create_heatmap(returns_dict: dict) -> go.Figure:
+    """True heatmap: tickers × days daily return matrix.
 
-    fig = go.Figure(go.Bar(
-        x=symbols, y=values, marker_color=colors,
-        text=[f"{v:+.2f}%" for v in values], textposition="outside",
-        textfont=dict(size=10), hovertemplate="%{x}: %{y:.2f}%<extra></extra>",
+    Args:
+        returns_dict: {ticker: np.array of daily returns (last N days)}
+    """
+    # Pad shorter series with NaN so matrix is rectangular
+    max_len = max(len(v) for v in returns_dict.values())
+    tickers_list = list(returns_dict.keys())
+    matrix = np.full((len(tickers_list), max_len), np.nan)
+    for i, t in enumerate(tickers_list):
+        vals = returns_dict[t]
+        matrix[i, -len(vals):] = vals  # right-align so most recent day is rightmost
+
+    # Day labels: most recent on right
+    day_labels = [f"d-{max_len - j}" for j in range(max_len)]
+
+    # Color scale: green (↓) → white (flat) → red (↑) — China convention
+    vmax = np.nanmax(np.abs(matrix)) if not np.all(np.isnan(matrix)) else 0.02
+
+    fig = go.Figure(go.Heatmap(
+        z=matrix,
+        x=day_labels,
+        y=tickers_list,
+        colorscale=[[0, "#22c55e"], [0.5, "#1e1e2f"], [1, "#ef4444"]],
+        zmid=0,
+        zmin=-vmax,
+        zmax=vmax,
+        hovertemplate="%{y} %{x}: %{z:.2%}<extra></extra>",
+        showscale=True,
+        colorbar=dict(title="Return", tickformat=".1%", len=0.5),
     ))
-    fig.update_layout(template=DARK_TEMPLATE, height=250, yaxis_title="Daily Change (%)", margin=dict(l=0, r=0, t=10, b=40))
+    fig.update_layout(
+        template=DARK_TEMPLATE, height=max(200, 22 * len(tickers_list)),
+        margin=dict(l=10, r=10, t=10, b=40),
+        xaxis=dict(side="top", tickfont=dict(size=9)),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def create_convergence_chart(rewards: np.ndarray = None,
+                              conv_ratio: float = 0.0, slope: float = 0.0,
+                              ticker: str = "",
+                              seeds_matrix: np.ndarray = None) -> go.Figure:
+    """DQN training convergence: episode reward with optional multi-seed shading.
+
+    Args:
+        rewards: Single-seed reward array (legacy).
+        seeds_matrix: shape (n_seeds, n_episodes) for shaded mean±std plot.
+    """
+    fig = go.Figure()
+
+    if seeds_matrix is not None and seeds_matrix.shape[0] >= 2:
+        episodes = np.arange(1, seeds_matrix.shape[1] + 1)
+        mean = np.mean(seeds_matrix, axis=0)
+        std = np.std(seeds_matrix, axis=0)
+
+        # Std shading
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([episodes, episodes[::-1]]),
+            y=np.concatenate([mean + std, (mean - std)[::-1]]),
+            fill="toself", fillcolor="rgba(56,189,248,0.12)",
+            line=dict(color="rgba(56,189,248,0)"), showlegend=True,
+            name="±1σ",
+        ))
+        # Mean line
+        window = max(5, len(episodes) // 20)
+        ma = np.convolve(mean, np.ones(window) / window, mode="valid")
+        fig.add_trace(go.Scatter(
+            x=episodes, y=mean, mode="lines", name="Mean Reward",
+            line=dict(color=COLORS["primary"], width=1.2),
+        ))
+        fig.add_trace(go.Scatter(
+            x=episodes[window - 1:], y=ma, mode="lines", name=f"MA({window})",
+            line=dict(color=COLORS["up"], width=2),
+        ))
+        # Individual seeds (thin, transparent)
+        for i in range(seeds_matrix.shape[0]):
+            fig.add_trace(go.Scatter(
+                x=episodes, y=seeds_matrix[i], mode="lines",
+                name=f"Seed {i+1}",
+                line=dict(width=0.4, color=COLORS["muted"]),
+                opacity=0.35, showlegend=(i == 0),
+            ))
+        title = f"Convergence — {ticker} ({seeds_matrix.shape[0]} seeds)"
+    elif rewards is not None:
+        episodes = np.arange(1, len(rewards) + 1)
+        window = max(5, len(rewards) // 20)
+        ma = np.convolve(rewards, np.ones(window) / window, mode="valid")
+
+        fig.add_trace(go.Scatter(
+            x=episodes, y=rewards, mode="lines", name="Episode Reward",
+            line=dict(color=COLORS["primary"], width=0.6),
+            opacity=0.6,
+        ))
+        fig.add_trace(go.Scatter(
+            x=episodes[window - 1:], y=ma, mode="lines", name=f"MA({window})",
+            line=dict(color=COLORS["up"], width=2),
+        ))
+        z = np.polyfit(episodes, rewards, 1)
+        trend = np.poly1d(z)
+        fig.add_trace(go.Scatter(
+            x=episodes[[0, -1]], y=trend(episodes[[0, -1]]),
+            mode="lines", name="Trend",
+            line=dict(color=COLORS["muted"], width=1.5, dash="dash"),
+        ))
+        title = f"Convergence — {ticker}" if ticker else "Convergence"
+    else:
+        return fig
+
+    fig.update_layout(
+        template=DARK_TEMPLATE, height=280,
+        title=dict(text=f"{title}  ·  ratio={conv_ratio:.2f}  slope={slope:+.4f}",
+                   font=dict(size=11, color=COLORS["muted"])),
+        xaxis_title="Episode", yaxis_title="Reward",
+        legend=dict(orientation="h", yanchor="top", y=-0.18),
+        margin=dict(l=20, r=20, t=35, b=30),
+    )
     return fig
 
 

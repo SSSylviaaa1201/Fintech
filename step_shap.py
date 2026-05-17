@@ -63,7 +63,7 @@ def train_agent_for_ticker(db: DatabaseManager, ticker: str) -> tuple[DQNAgent, 
 
     train_df, val_df, test_df = walk_forward_split(df_with)
     agent = DQNAgent()
-    agent = train_dqn(train_df, val_df, episodes=config.EPISODES)
+    agent = train_dqn(train_df, val_df, episodes=config.EPISODES, ticker=ticker)
     return agent, test_df
 
 

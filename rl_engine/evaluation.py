@@ -18,9 +18,14 @@ def backtest(
     agent: DQNAgent,
     df: pd.DataFrame,
     initial_capital: float = INITIAL_CAPITAL,
+    episode: int = 0,
+    ticker: str = "",
+    sentiment_bonus_enabled: bool = True,
 ) -> dict:
     """Run a full backtest and return performance metrics."""
-    log_df, total_reward = evaluate_agent(agent, df, initial_capital)
+    log_df, total_reward = evaluate_agent(agent, df, initial_capital,
+                                          episode=episode, ticker=ticker,
+                                          sentiment_bonus_enabled=sentiment_bonus_enabled)
 
     equity = log_df["portfolio_value"]
     returns = log_df["returns"]
@@ -48,6 +53,7 @@ def run_ablation_study(
     episodes: int = 200,
     initial_capital: float = INITIAL_CAPITAL,
     seeds: Optional[list] = None,
+    ticker: str = "",
 ) -> dict:
     """
     Compare RL performance with vs. without NLP sentiment signal.
@@ -66,6 +72,7 @@ def run_ablation_study(
     all_with = []
     all_without = []
 
+    seed_idx = 0
     for seed in seed_list:
         seed_label = f"seed={seed}" if seed is not None else "default"
         for label, df in [("with_nlp", df_with_sentiment), ("without_nlp", df_without_sentiment)]:
@@ -73,9 +80,14 @@ def run_ablation_study(
             train_df, val_df, test_df = walk_forward_split(df)
 
             agent = DQNAgent(seed=seed)
+            # Unique ticker tag so convergence curves don't overwrite across seeds/conditions
+            curve_tag = f"{ticker}_seed{seed}_{label}"
             agent = train_dqn(train_df, val_df, episodes=episodes,
-                            initial_capital=initial_capital, agent=agent, seed=seed)
-            metrics = backtest(agent, test_df, initial_capital=initial_capital)
+                            initial_capital=initial_capital, agent=agent, seed=seed,
+                            ticker=curve_tag, sentiment_bonus_enabled=False)
+            metrics = backtest(agent, test_df, initial_capital=initial_capital,
+                             episode=seed_idx + 1, ticker=ticker,
+                             sentiment_bonus_enabled=False)
             metrics["seed"] = seed
 
             if label == "with_nlp":
@@ -86,6 +98,7 @@ def run_ablation_study(
             logger.info("%s [%s]: Sharpe=%.4f, MDD=%.4f, Return=%.4f",
                         label, seed_label, metrics["sharpe_ratio"],
                         metrics["max_drawdown"], metrics["total_return"])
+        seed_idx += 1
 
     # Aggregate across seeds
     def _aggregate(seed_metrics: list[dict]) -> dict:
@@ -108,18 +121,22 @@ def run_ablation_study(
     # Comparison summary (use averaged values)
     delta_sharpe = results["with_nlp"]["sharpe_ratio"] - results["without_nlp"]["sharpe_ratio"]
     delta_return = results["with_nlp"]["total_return"] - results["without_nlp"]["total_return"]
+    delta_mdd = results["with_nlp"]["max_drawdown"] - results["without_nlp"]["max_drawdown"]
     sharpe_std = np.sqrt(
         results["with_nlp"]["seed_std"].get("sharpe_ratio", 0) ** 2 +
         results["without_nlp"]["seed_std"].get("sharpe_ratio", 0) ** 2
     )
-    logger.info("Ablation delta: Sharpe=%+.4f±%.4f, Return=%+.4f", delta_sharpe, sharpe_std, delta_return)
+    logger.info("Ablation delta: Sharpe=%+.4f±%.4f, Return=%+.4f, MDD=%+.4f",
+                delta_sharpe, sharpe_std, delta_return, delta_mdd)
 
     results["summary"] = {
         "sharpe_delta": delta_sharpe,
         "return_delta": delta_return,
+        "mdd_delta": delta_mdd,
         "sharpe_delta_std": sharpe_std,
         "nlp_improves_sharpe": delta_sharpe > 0,
         "nlp_improves_return": delta_return > 0,
+        "nlp_improves_mdd": delta_mdd > 0,
         "n_seeds": len(seed_list),
     }
 

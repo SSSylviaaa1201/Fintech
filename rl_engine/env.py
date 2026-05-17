@@ -34,13 +34,15 @@ class FinancialTradingEnv(gym.Env):
         transaction_cost_pct: float = 0.001,
         trade_fraction: float = 0.25,
         render_mode: Optional[str] = None,
+        sentiment_bonus_enabled: bool = True,
     ):
         super().__init__()
 
         self.df = df.reset_index(drop=True)
         self.initial_capital = initial_capital
         self.transaction_cost_pct = transaction_cost_pct
-        self.trade_fraction = trade_fraction  # fraction of cash/position per trade
+        self.trade_fraction = trade_fraction
+        self.sentiment_bonus_enabled = sentiment_bonus_enabled
 
         # Ensure required columns exist
         required = ["close", "MA50", "MA200", "RSI", "MACD", "sentiment_score"]
@@ -192,14 +194,15 @@ class FinancialTradingEnv(gym.Env):
         # Sentiment-position alignment bonus (reward shaping)
         sentiment = float(self.df.iloc[self.current_step].get("sentiment_score", 0.0))
         sentiment_bonus = 0.0
-        if sentiment > 0.3 and self.shares > 0:
-            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
-        elif sentiment > 0.3 and self.shares == 0:
-            sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS   # penalty for staying out during positive signal
-        elif sentiment < -0.3 and self.shares > 0:
-            sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
-        elif sentiment < -0.3 and self.shares == 0:
-            sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS    # reward for staying out during negative signal
+        if self.sentiment_bonus_enabled:
+            if sentiment > 0.3 and self.shares > 0:
+                sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+            elif sentiment > 0.3 and self.shares == 0:
+                sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
+            elif sentiment < -0.3 and self.shares > 0:
+                sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
+            elif sentiment < -0.3 and self.shares == 0:
+                sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
 
         reward = pct_return + cash_penalty + concentration_penalty + frequency_penalty + sentiment_bonus
 
@@ -224,6 +227,8 @@ class FinancialTradingEnv(gym.Env):
             "drawdown": drawdown,
             "trade_count": self.trade_count,
             "drawdown_terminated": drawdown_terminated,
+            "date": self.df.iloc[self.current_step].get("date", None),
+            "sentiment_score": sentiment,
         }
 
         obs = self._norm_state() if not terminated else np.zeros(STATE_DIM, dtype=np.float32)

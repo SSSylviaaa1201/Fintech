@@ -2,7 +2,7 @@
 
 Data sources (4 DB tables):
   market_data      → K-line, indicators, ticker tape, heatmap
-  sentiment_signals → 4-method overlay, sentiment summary
+  sentiment_signals → 3-method overlay, sentiment summary
   trading_logs     → equity curve, drawdown, best episode
   trade_orders     → paper trading portfolio, P&L, order history
 """
@@ -18,12 +18,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import DB_PATH, TICKERS, INITIAL_CAPITAL, REFRESH_INTERVAL_SECONDS
+from config import DB_PATH, TICKERS, INITIAL_CAPITAL, REFRESH_INTERVAL_SECONDS, DATA_DIR
 from data_storage.db_manager import DatabaseManager
 from dashboard.components.charts import (
     COLORS, DARK_TEMPLATE,
     create_candlestick_chart, create_sentiment_quad, create_heatmap,
     create_rsi_chart, create_macd_chart, create_equity_curve,
+    create_convergence_chart,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -473,6 +474,63 @@ if tape_parts:
     """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Date Range Filter
+# ═══════════════════════════════════════════════════════════════════════════
+
+if "date_range" not in st.session_state:
+    st.session_state.date_range = (None, None)
+
+# Determine available date range from market data
+date_series = None
+if has_market:
+    date_series = pd.to_datetime(market_df["date"])
+elif has_logs and "date" in logs_df.columns:
+    date_series = pd.to_datetime(logs_df["date"])
+
+if date_series is not None and len(date_series) > 1:
+    data_min = date_series.min().date()
+    data_max = date_series.max().date()
+
+    with st.expander("📅 Filter Date Range", expanded=False):
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            start = st.date_input("From", value=st.session_state.date_range[0] or data_min,
+                                  min_value=data_min, max_value=data_max,
+                                  key="date_start")
+        with c2:
+            end = st.date_input("To", value=st.session_state.date_range[1] or data_max,
+                                min_value=data_min, max_value=data_max,
+                                key="date_end")
+        with c3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Reset", use_container_width=True):
+                st.session_state.date_range = (None, None)
+                st.rerun()
+
+        if start and end and (start > data_min or end < data_max):
+            st.session_state.date_range = (start, end)
+            # Filter market data
+            if has_market:
+                market_dates = pd.to_datetime(market_df["date"])
+                mask = (market_dates >= pd.Timestamp(start)) & (market_dates <= pd.Timestamp(end))
+                market_df = market_df[mask].reset_index(drop=True)
+                has_market = not market_df.empty
+            # Filter sentiment data
+            if has_sentiment:
+                sent_dates = pd.to_datetime(sentiment_df["date"])
+                mask = (sent_dates >= pd.Timestamp(start)) & (sent_dates <= pd.Timestamp(end))
+                sentiment_df = sentiment_df[mask].reset_index(drop=True)
+                has_sentiment = not sentiment_df.empty
+            # Filter trading logs
+            if has_logs and "date" in logs_df.columns:
+                log_dates = pd.to_datetime(logs_df["date"])
+                mask = (log_dates >= pd.Timestamp(start)) & (log_dates <= pd.Timestamp(end))
+                logs_df = logs_df[mask].reset_index(drop=True)
+                has_logs = not logs_df.empty
+        else:
+            st.session_state.date_range = (None, None)
+
+# ═══════════════════════════════════════════════════════════════════════════
 # KPI Row
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -543,7 +601,7 @@ with main_col:
             st.caption("MACD unavailable")
 
     # Row 3: Sentiment
-    st.markdown('<p class="section-header">NLP Sentiment — 4 Methods</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">NLP Sentiment — 3 Methods</p>', unsafe_allow_html=True)
     if has_sentiment:
         try:
             fig_sent = create_sentiment_quad(sentiment_df)
@@ -556,8 +614,13 @@ with main_col:
     # Row 4: Portfolio
     if has_logs:
         st.markdown('<p class="section-header">Portfolio Performance</p>', unsafe_allow_html=True)
-        best_ep = logs_df.groupby("episode")["portfolio_value"].last().idxmax()
-        ep_logs = logs_df[logs_df["episode"] == best_ep]
+        # Filter to current ticker's best episode
+        tk_logs = logs_df[logs_df["ticker"] == ticker] if "ticker" in logs_df.columns else logs_df
+        if not tk_logs.empty:
+            best_ep = tk_logs.groupby("episode")["portfolio_value"].last().idxmax()
+            ep_logs = tk_logs[tk_logs["episode"] == best_ep]
+        else:
+            ep_logs = tk_logs
 
         c_perf1, c_perf2 = st.columns(2)
         with c_perf1:
@@ -587,16 +650,67 @@ with main_col:
             except Exception:
                 st.caption("Drawdown chart unavailable")
 
-    # Row 5: Heatmap (batched)
+    # Row 5: Convergence plot
+    curves_dir = Path(DATA_DIR) / "training_curves"
+    # Prefer multi-seed (ablation) data: {ticker}_seed*_with_nlp_rewards.npz
+    seed_files = sorted(curves_dir.glob(f"{ticker}_seed*_with_nlp_rewards.npz")) if curves_dir.exists() else []
+    single_file = curves_dir / f"{ticker}_rewards.npz" if curves_dir.exists() else None
+    legacy_file = curves_dir / "rewards.npz" if curves_dir.exists() else None
+
+    has_multi = len(seed_files) >= 2
+    has_single = single_file.exists() if single_file else False
+    has_legacy = legacy_file.exists() if legacy_file else False
+
+    if has_multi or has_single or has_legacy:
+        st.markdown('<p class="section-header">Convergence</p>', unsafe_allow_html=True)
+        try:
+            if has_multi:
+                # Load all seeds and stack into matrix
+                seed_rewards = []
+                for sf in seed_files:
+                    d = np.load(sf)
+                    if "rewards" in d:
+                        seed_rewards.append(d["rewards"])
+                if len(seed_rewards) >= 2:
+                    min_len = min(len(r) for r in seed_rewards)
+                    seeds_matrix = np.array([r[:min_len] for r in seed_rewards])
+                    fig_conv = create_convergence_chart(
+                        seeds_matrix=seeds_matrix, ticker=f"{ticker} (with NLP)")
+                    st.plotly_chart(fig_conv, key="conv_multi",
+                                    use_container_width=True, config={"displayModeBar": False})
+            elif has_single:
+                conv_data = np.load(single_file)
+                fig_conv = create_convergence_chart(
+                    rewards=conv_data["rewards"],
+                    conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
+                    slope=float(conv_data.get("slope", 0.0)),
+                    ticker=ticker)
+                st.plotly_chart(fig_conv, key="conv_single",
+                                use_container_width=True, config={"displayModeBar": False})
+            elif has_legacy:
+                conv_data = np.load(legacy_file)
+                fig_conv = create_convergence_chart(
+                    rewards=conv_data["rewards"],
+                    conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
+                    slope=float(conv_data.get("slope", 0.0)),
+                    ticker=ticker)
+                st.plotly_chart(fig_conv, key="conv_legacy",
+                                use_container_width=True, config={"displayModeBar": False})
+        except Exception:
+            st.caption("Convergence plot unavailable")
+
+    # Row 6: Market returns heatmap (tickers × days)
     st.markdown('<p class="section-header">Market Heatmap</p>', unsafe_allow_html=True)
-    pct_changes = {}
+    returns_matrix = {}
     for t in st.session_state.watchlist[:15]:
         mkt = watchlist_data.get(t)
         if mkt is not None and len(mkt) > 1:
-            pct_changes[t] = (mkt["close"].iloc[-1] - mkt["close"].iloc[-2]) / mkt["close"].iloc[-2] * 100
-    if pct_changes:
+            rets = mkt["close"].pct_change().dropna().tail(20).values
+            if len(rets) >= 3:
+                returns_matrix[t] = rets
+    if returns_matrix:
         try:
-            fig_hm = create_heatmap(pct_changes)
+            fig_hm = create_heatmap(returns_matrix)
             st.plotly_chart(fig_hm, key="heatmap", use_container_width=True, config={"displayModeBar": False})
         except Exception:
             st.caption("Heatmap unavailable")
@@ -697,36 +811,48 @@ with side_col:
     # ── Ablation Summary ──
     st.markdown('<p class="section-header">Ablation Results</p>', unsafe_allow_html=True)
 
-    # Try to parse the latest run report
-    report_path = Path(__file__).parent.parent / "run_report_2026-05-09.md"
-    if report_path.exists():
+    import json
+    ablation_json = Path(__file__).parent.parent / "data" / "ablation_results.json"
+    if ablation_json.exists():
         try:
-            report_text = report_path.read_text(encoding="utf-8")
-            # Extract basic stats
-            import re
-            pos_match = re.search(r"正向贡献.*?(\d+)/28.*?(\d+\.\d+)%", report_text)
-            neg_match = re.search(r"负向贡献.*?(\d+)/28.*?(\d+\.\d+)%", report_text)
-            top_match = re.search(r"\*\*NLP 正向贡献.*?\n\n\| 1 \| \*\*(\w+)\*\*.*?\+([\d.]+)", report_text)
+            ablation_data = json.loads(ablation_json.read_text(encoding="utf-8"))
+            l1 = ablation_data.get("layer1_ablation", {})
+            pos = l1.get("nlp_positive", 0)
+            neg = l1.get("nlp_negative", 0)
+            neu = l1.get("nlp_neutral", 0)
+            rate = l1.get("positive_rate", 0)
+            mdd_imp = l1.get("nlp_mdd_improved", 0)
 
-            if pos_match:
-                st.markdown(f"""
-                <div class="glass-card">
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                        <span class="label">NLP Positive</span>
-                        <span style="color:#22c55e;font-weight:600;">{pos_match.group(1)}/28 ({pos_match.group(2)}%)</span></div>
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                        <span class="label">NLP Negative</span>
-                        <span style="color:#ef4444;font-weight:600;">{neg_match.group(1)}/28 ({neg_match.group(2)}%)</span></div>
-                    <div style="display:flex;justify-content:space-between;">
-                        <span class="label">Top Performer</span>
-                        <span style="color:#38bdf8;font-weight:600;">{top_match.group(1) if top_match else 'N/A'} Δ{top_match.group(2) if top_match else ''}</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-                st.caption(f"Source: {report_path.name}")
-            else:
-                st.caption("Ablation report found but could not parse.")
+            # Top performer by Sharpe delta
+            tickers = l1.get("tickers", {})
+            top_ticker, top_delta, top_mdd_delta = None, -999, 0
+            for t, s in tickers.items():
+                d = s.get("sharpe_delta", 0)
+                if d > top_delta:
+                    top_delta, top_ticker, top_mdd_delta = d, t, s.get("mdd_delta", 0)
+
+            st.markdown(f"""
+            <div class="glass-card">
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                    <span class="label">NLP Positive (Sharpe)</span>
+                    <span style="color:#22c55e;font-weight:600;">{pos}/28 ({rate}%)</span></div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                    <span class="label">NLP Neutral</span>
+                    <span style="color:#fbbf24;font-weight:600;">{neu}/28 ({round(neu/28*100,1)}%)</span></div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                    <span class="label">NLP Negative</span>
+                    <span style="color:#ef4444;font-weight:600;">{neg}/28 ({round(neg/28*100,1)}%)</span></div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                    <span class="label">MDD Improved</span>
+                    <span style="color:#38bdf8;font-weight:600;">{mdd_imp}/28 ({round(mdd_imp/28*100,1)}%)</span></div>
+                <div style="display:flex;justify-content:space-between;">
+                    <span class="label">Top Performer</span>
+                    <span style="color:#38bdf8;font-weight:600;">{top_ticker or 'N/A'} Δ{top_delta:+.3f}</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.caption(f"Source: data/ablation_results.json  ·  {ablation_data.get('timestamp','')[:16]}")
         except Exception:
-            st.caption("Could not read ablation report.")
+            st.caption("Could not read ablation results.")
     elif has_logs:
         st.info(f"{len(logs_df):,} training log entries available.")
     else:

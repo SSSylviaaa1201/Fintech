@@ -27,7 +27,13 @@ def walk_forward_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd
     )
 
 
-def run_episode(env: FinancialTradingEnv, agent: DQNAgent, train: bool = True) -> tuple[float, list[dict]]:
+def run_episode(
+    env: FinancialTradingEnv,
+    agent: DQNAgent,
+    train: bool = True,
+    episode: int = 0,
+    ticker: str = "",
+) -> tuple[float, list[dict]]:
     """Run a single episode. Returns (total_reward, log_records)."""
     state, _ = env.reset()
     done = False
@@ -44,6 +50,8 @@ def run_episode(env: FinancialTradingEnv, agent: DQNAgent, train: bool = True) -
             agent.update()
 
         logs.append({
+            "episode": episode,
+            "ticker": ticker,
             "step": env.current_step,
             "action": action,
             "price": info["price"],
@@ -51,6 +59,8 @@ def run_episode(env: FinancialTradingEnv, agent: DQNAgent, train: bool = True) -
             "cash": info["cash"],
             "shares": info["shares"],
             "reward": reward,
+            "sentiment_score": info.get("sentiment_score", 0.0),
+            "date": info.get("date", None),
         })
 
         state = next_state
@@ -66,25 +76,30 @@ def train_dqn(
     initial_capital: float = INITIAL_CAPITAL,
     agent: Optional[DQNAgent] = None,
     seed: Optional[int] = None,
+    ticker: str = "",
+    sentiment_bonus_enabled: bool = True,
 ) -> DQNAgent:
     """Train DQN agent on training data with optional validation."""
 
     if agent is None:
         agent = DQNAgent(seed=seed)
 
-    train_env = FinancialTradingEnv(train_df, initial_capital=initial_capital)
-    val_env = FinancialTradingEnv(val_df, initial_capital=initial_capital) if val_df is not None else None
+    train_env = FinancialTradingEnv(train_df, initial_capital=initial_capital,
+                                    sentiment_bonus_enabled=sentiment_bonus_enabled)
+    val_env = (FinancialTradingEnv(val_df, initial_capital=initial_capital,
+                                   sentiment_bonus_enabled=sentiment_bonus_enabled)
+               if val_df is not None else None)
 
     best_val_return = -np.inf
     episode_rewards = []
 
     for ep in range(1, episodes + 1):
-        train_reward, _ = run_episode(train_env, agent, train=True)
+        train_reward, _ = run_episode(train_env, agent, train=True, episode=ep, ticker=ticker)
         episode_rewards.append(train_reward)
         agent.decay_epsilon()
 
         if (val_env is not None) and (ep % 10 == 0):
-            val_reward, _ = run_episode(val_env, agent, train=False)
+            val_reward, _ = run_episode(val_env, agent, train=False, episode=ep, ticker=ticker)
             if val_reward > best_val_return:
                 best_val_return = val_reward
                 agent.save()
@@ -107,11 +122,13 @@ def train_dqn(
     logger.info("Convergence: first_half_avg=%.4f, second_half_avg=%.4f, ratio=%.2f, slope=%.6f",
                 first_half, second_half, conv_ratio, slope)
 
-    # Save training curve for report (compact)
+    # Save training curve per ticker
     try:
         curve_path = Path(DATA_DIR) / "training_curves"
         curve_path.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(curve_path / f"rewards.npz", rewards=rewards)
+        safe_name = ticker.replace("/", "_") if ticker else "latest"
+        np.savez_compressed(curve_path / f"{safe_name}_rewards.npz",
+                            rewards=rewards, conv_ratio=conv_ratio, slope=slope)
     except Exception:
         pass
 
@@ -125,10 +142,14 @@ def evaluate_agent(
     agent: DQNAgent,
     df: pd.DataFrame,
     initial_capital: float = INITIAL_CAPITAL,
+    episode: int = 0,
+    ticker: str = "",
+    sentiment_bonus_enabled: bool = True,
 ) -> tuple[pd.DataFrame, float]:
     """Run agent on data and return log DataFrame + total return."""
-    env = FinancialTradingEnv(df, initial_capital=initial_capital)
-    total_reward, logs = run_episode(env, agent, train=False)
+    env = FinancialTradingEnv(df, initial_capital=initial_capital,
+                              sentiment_bonus_enabled=sentiment_bonus_enabled)
+    total_reward, logs = run_episode(env, agent, train=False, episode=episode, ticker=ticker)
 
     log_df = pd.DataFrame(logs)
     log_df["returns"] = log_df["portfolio_value"].pct_change().fillna(0)

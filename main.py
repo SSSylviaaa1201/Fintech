@@ -80,7 +80,7 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
     from nlp_pipeline.sentiment_lexicon import vader_sentiment_batch
     from nlp_pipeline.sentiment_lr import lr_sentiment_batch
     from nlp_pipeline.sentiment_finbert import finbert_sentiment_batch
-    from nlp_pipeline.aggregator import get_merged_sentiment, compute_f1_against_finbert
+    from nlp_pipeline.aggregator import get_merged_sentiment, compute_inter_method_agreement
     from vector_store.chroma_store import index_news
 
     all_aggregated = []
@@ -94,7 +94,7 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
             logger.info("  %s: sentiment already exists (%d methods), skipping", ticker, len(existing_methods))
             continue
 
-        news_df = db.get_news(ticker, limit=2000)
+        news_df = db.get_news_stratified(ticker, per_year=60)  # ~60 articles/year → ~1000 total across 17yr
         if news_df.empty:
             logger.warning("  %s: no news, skipping", ticker)
             continue
@@ -124,17 +124,17 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
             ag = result["agreement"]
             logger.info("    Agreement: kappa=%s, level=%s", ag.get("kappa"), ag.get("agreement_level"))
 
-        # F1 scores (VADER & LR vs FinBERT as pseudo-ground-truth)
+        # Inter-method directional agreement (no method treated as ground truth)
         try:
-            f1_metrics = compute_f1_against_finbert(df_vader, df_lr, df_finbert)
-            for method in ["vader", "lr"]:
-                m = f1_metrics.get(method, {})
-                if "error" not in m:
-                    logger.info("    F1 %s: macro=%.3f, pos=%.3f, neg=%.3f (n=%d)",
-                                method.upper(), m["f1_macro"], m["f1_positive"],
-                                m["f1_negative"], m.get("n_samples", 0))
+            agreement = compute_inter_method_agreement(df_vader, df_lr, df_finbert)
+            avg_f1 = agreement.get("average_pairwise_f1")
+            if avg_f1 is not None:
+                logger.info("    Inter-method F1: avg=%.3f (%d dates)", avg_f1, agreement.get("n_dates", 0))
+            # Log pairwise agreement rates
+            for pair, rate in agreement.get("pairwise_agreement_rates", {}).items():
+                logger.debug("      Agreement %s: %.1f%%", pair, rate * 100)
         except Exception:
-            logger.debug("F1 computation skipped for %s", ticker)
+            logger.debug("Inter-method agreement skipped for %s", ticker)
 
         # Store in DB
         records = aggregated.to_dict("records")
@@ -146,6 +146,25 @@ def step_nlp(db: DatabaseManager) -> pd.DataFrame:
             index_news(news_df)
         except Exception:
             logger.debug("Vector indexing skipped for %s", ticker)
+
+    # News quality diagnostics: detect template/duplicate content
+    try:
+        from nlp_pipeline.aggregator import compute_news_quality
+        all_news = []
+        for ticker in config.TICKERS:
+            ndf = db.get_news(ticker, limit=2000)
+            if not ndf.empty:
+                all_news.append(ndf)
+        if all_news:
+            combined_news = pd.concat(all_news, ignore_index=True)
+            quality = compute_news_quality(combined_news)
+            gq = quality["global"]
+            logger.info("News Quality: uniqueness=%.1f%%, template=%.1f%%, %d articles",
+                        gq["uniqueness_ratio"] * 100, gq["template_ratio"] * 100, gq["n_articles"])
+            if gq["quality_warning"] != "News quality acceptable":
+                logger.warning(gq["quality_warning"])
+    except Exception:
+        logger.debug("News quality check skipped")
 
     if all_aggregated:
         return pd.concat(all_aggregated, ignore_index=True)
@@ -228,10 +247,15 @@ def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[
         # Compute technical indicators on FULL market data first (MA200 needs 200 rows)
         df = compute_indicators(market_df)
 
+        # Price baseline for state normalization: first close of full market data
+        # Ensures consistent normalization across train/val/test splits
+        price_baseline = float(df["close"].iloc[0]) if len(df) > 0 else 1.0
+
         # Then align to news period
         sent_df = db.get_sentiment(ticker)
         df = _align_market_to_news(df, sent_df)
         df = df.reset_index(drop=True)  # ensure clean index, date as column only
+        df["price_baseline"] = price_baseline
 
         # Attach sentiment if requested (consensus → EMA → gate)
         if with_sentiment:
@@ -244,13 +268,20 @@ def build_rl_features(db: DatabaseManager, with_sentiment: bool = True) -> dict[
                     signal_df["date"] = pd.to_datetime(signal_df["date"]).dt.date
                     df["date"] = pd.to_datetime(df["date"]).dt.date
                     df = df.merge(signal_df, on="date", how="left")
-                    df["sentiment_score"] = df["sentiment_score"].fillna(0.0)
+                    # Mark days with real sentiment data before filling
+                    df["sentiment_mask"] = df["sentiment_score"].notna().astype(float)
+                    # Forward-fill missing sentiment (carry last known value), then zero remainder
+                    df["sentiment_score"] = df["sentiment_score"].ffill().fillna(0.0)
+                    df["sentiment_mask"] = df["sentiment_mask"].fillna(0.0)
                 else:
                     df["sentiment_score"] = 0.0
+                    df["sentiment_mask"] = 0.0
             else:
                 df["sentiment_score"] = 0.0
+                df["sentiment_mask"] = 0.0
         else:
             df["sentiment_score"] = 0.0
+            df["sentiment_mask"] = 0.0
 
         # Sentiment momentum: short-term avg and trend direction
         df["sentiment_ma5"] = df["sentiment_score"].rolling(window=5, min_periods=1).mean()
@@ -496,8 +527,8 @@ def step_ablation(db: DatabaseManager) -> dict:
 
     import config as cfg
     sector_map = dict(zip(cfg.TICKERS, [
-        "Tech"] * 7 + ["Finance"] * 5 + ["Healthcare"] * 4 +
-        ["Consumer"] * 5 + ["Energy/Industrial"] * 5 + ["Comm/Utility"] * 2))
+        "Tech"] * 10 + ["Finance"] * 10 + ["Healthcare"] * 10 +
+        ["Consumer"] * 10 + ["Energy/Industrial"] * 10 + ["Comm/Utility"] * 10))
 
     bh_wins_sharpe = 0
     bh_wins_return = 0
@@ -557,6 +588,43 @@ def step_ablation(db: DatabaseManager) -> dict:
         logger.info("  %s: DQN Sharpe=%.3f, BH Sharpe=%.3f, DQN MDD=%.3f, BH MDD=%.3f, Win=%d/%d",
                     sector, avg_dqn, avg_bh, avg_dqn_mdd, avg_bh_mdd, data["wins"], data["total"])
 
+    # ── Statistical significance tests (P2-8/9 fix) ──
+    logger.info("\n" + "-" * 40)
+    logger.info("STATISTICAL SIGNIFICANCE: DQN vs Buy&Hold")
+    logger.info("-" * 40)
+
+    dqn_sharpes_all = [r["dqn_sharpe"] for r in layer2_rows]
+    bh_sharpes_all = [r["bh_sharpe"] for r in layer2_rows]
+    dqn_returns_all = [r["dqn_return"] for r in layer2_rows]
+    bh_returns_all = [r["bh_return"] for r in layer2_rows]
+
+    from utils.statistics import run_dqn_vs_bh_tests
+    stat_results = run_dqn_vs_bh_tests(
+        dqn_sharpes_all, bh_sharpes_all,
+        dqn_returns_all, bh_returns_all,
+        seed=42,
+    )
+
+    bt = stat_results["binomial_test_sharpe"]
+    tt = stat_results["paired_t_test"]
+    bc = stat_results["bootstrap_ci"]
+
+    logger.info("Binomial test (Sharpe wins): p=%.4f, %d/%d (%.1f%%)",
+                bt["p_value"], bt["n_wins"], bt["n_total"], bt["win_rate"] * 100)
+    logger.info("  Significant at 5%%: %s  |  Significant at 1%%: %s",
+                bt["significant_05"], bt["significant_01"])
+    logger.info("Paired t-test (Sharpe diff): t=%.4f, p=%.4f, Cohen's d=%.3f (%s)",
+                tt.get("t_stat", 0), tt["p_value"], tt["cohens_d"], tt["effect_size"])
+    logger.info("  CI 95%%: [%.4f, %.4f]  |  Significant: %s",
+                tt["ci_95"][0], tt["ci_95"][1], tt["significant_05"])
+    logger.info("Bootstrap CI 95%% on Sharpe diff: [%.4f, %.4f]  |  Zero in CI: %s",
+                bc["ci_95"][0], bc["ci_95"][1], bc["zero_in_ci_95"])
+    logger.info("\n  >>> %s", stat_results["interpretation"])
+
+    mc_fdr = stat_results["multiple_comparison_fdr"]
+    logger.info("Multiple comparison (FDR): %d/%d tickers significant after correction",
+                mc_fdr["n_significant_05"], mc_fdr["n_tests"])
+
     # ── Layer 3: Paper Trading Forward Validation ──
     logger.info("\n" + "=" * 60)
     logger.info("LAYER 3: Paper Trading Forward Validation")
@@ -590,6 +658,7 @@ def step_ablation(db: DatabaseManager) -> dict:
             "return_win_rate": round(bh_wins_return / len(ablation_results) * 100, 1) if ablation_results else 0,
             "by_sector": {s: {"avg_dqn_sharpe": round(np.mean(d["dqn_sharpe"]), 3), "avg_bh_sharpe": round(np.mean(d["bh_sharpe"]), 3), "avg_dqn_mdd": round(np.mean(d["dqn_mdd"]), 4) if d.get("dqn_mdd") else None, "avg_bh_mdd": round(np.mean(d["bh_mdd"]), 4) if d.get("bh_mdd") else None, "wins": d["wins"], "total": d["total"]} for s, d in sector_dqn_vs_bh.items()},
             "tickers": layer2_rows,
+            "statistical_tests": stat_results,
         },
         "layer3_paper_trading": paper_results,
     }

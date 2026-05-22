@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import INITIAL_CAPITAL
+from config import INITIAL_CAPITAL, TRANSACTION_COST_PCT
 from rl_engine.dqn import DQNAgent
 from rl_engine.train import evaluate_agent, walk_forward_split, train_dqn
 from utils.metrics import cumulative_returns, max_drawdown, sharpe_ratio
@@ -30,16 +30,26 @@ def backtest(
     equity = log_df["portfolio_value"]
     returns = log_df["returns"]
 
-    # Buy-and-hold benchmark
-    bh_shares = int(initial_capital / df["close"].iloc[0])
-    bh_equity = df["close"] * bh_shares
+    # Buy-and-hold benchmark: same starting conditions as DQN agent
+    # DQN pays transaction_cost_pct per trade; B&H also pays it on initial purchase
+    test_start_price = float(df["close"].iloc[0])
+    tc = TRANSACTION_COST_PCT
+    gross_shares = initial_capital / test_start_price
+    bh_shares = int(gross_shares)
+    bh_cost = test_start_price * bh_shares * (1 + tc)
+    bh_cash = initial_capital - bh_cost  # unspent cash due to integer rounding
+    if bh_cash < 0:  # rounding edge case
+        bh_shares = int(initial_capital / (test_start_price * (1 + tc)))
+        bh_cost = test_start_price * bh_shares * (1 + tc)
+        bh_cash = initial_capital - bh_cost
+    bh_equity = df["close"] * bh_shares + bh_cash
 
     return {
         "total_return": float(equity.iloc[-1] / equity.iloc[0] - 1),
         "sharpe_ratio": sharpe_ratio(returns),
         "max_drawdown": max_drawdown(equity),
         "final_portfolio_value": float(equity.iloc[-1]),
-        "buy_and_hold_return": float(bh_equity.iloc[-1] / bh_equity.iloc[0] - 1),
+        "buy_and_hold_return": float((bh_equity.iloc[-1] / initial_capital) - 1),
         "buy_and_hold_sharpe": sharpe_ratio(bh_equity.pct_change().dropna()),
         "buy_and_hold_mdd": max_drawdown(bh_equity),
         "n_trades": int((log_df["action"] != 0).sum()),

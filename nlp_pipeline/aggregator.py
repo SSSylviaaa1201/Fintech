@@ -222,17 +222,19 @@ def compute_consensus_score(aggregated: pd.DataFrame, agreement: dict | None = N
     return result
 
 
-def compute_f1_against_finbert(
+def compute_inter_method_agreement(
     df_vader: pd.DataFrame,
     df_lr: pd.DataFrame,
     df_finbert: pd.DataFrame,
 ) -> dict:
-    """
-    Compute per-method F1 scores using FinBERT as pseudo-ground truth.
+    """Compute pairwise directional agreement between all sentiment methods.
 
-    Converts continuous scores to binary (|score| > 0.05 → positive/negative),
-    then computes precision, recall, F1 for each method vs. FinBERT.
-    Returns dict with per-method metrics suitable for NLP quality reporting.
+    This is an inter-method consistency measure, NOT an accuracy evaluation.
+    None of the methods is treated as ground truth. Instead, we compute:
+      - Pairwise F1 (directional agreement) for all method pairs
+      - Overall agreement rate (including neutrals)
+
+    Returns a symmetric agreement matrix + per-pair metrics.
     """
     dfs = {"vader": df_vader, "lr": df_lr, "finbert": df_finbert}
 
@@ -254,69 +256,186 @@ def compute_f1_against_finbert(
         return {"error": "insufficient_data", "n_samples": len(merged) if merged is not None else 0}
 
     def to_binary(series: pd.Series, threshold: float = 0.05) -> pd.Series:
-        """Convert scores to: 2=positive, 0=negative, 1=neutral (excluded later)."""
-        result = pd.Series(1, index=series.index)  # neutral
-        result[series > threshold] = 2              # positive
-        result[series < -threshold] = 0             # negative
+        """Convert scores to: 2=positive, 0=negative, 1=neutral."""
+        result = pd.Series(1, index=series.index)
+        result[series > threshold] = 2
+        result[series < -threshold] = 0
         return result
 
-    y_true = to_binary(merged["score_finbert"])
-
-    metrics = {}
-    for method in ["vader", "lr"]:
-        col = f"score_{method}"
-        if col not in merged.columns:
-            metrics[method] = {"error": "no_data"}
-            continue
-        y_pred = to_binary(merged[col])
-
-        # Exclude neutral from F1 (only evaluate directional agreement)
-        mask = (y_true != 1) & (y_pred != 1)
+    def compute_pairwise_f1(yt: pd.Series, yp: pd.Series) -> dict:
+        """Compute macro F1 between two binary series (excluding neutral)."""
+        mask = (yt != 1) & (yp != 1)
         if mask.sum() < 5:
-            metrics[method] = {"error": "too_few_directional_samples", "n": int(mask.sum())}
-            continue
-
-        yt = y_true[mask]
-        yp = y_pred[mask]
-
-        # Positive class (2) metrics
-        tp_pos = int(((yt == 2) & (yp == 2)).sum())
-        fp_pos = int(((yt != 2) & (yp == 2)).sum())
-        fn_pos = int(((yt == 2) & (yp != 2)).sum())
-
+            return {"error": "too_few_directional_samples", "n": int(mask.sum())}
+        yt_m, yp_m = yt[mask], yp[mask]
+        tp_pos = int(((yt_m == 2) & (yp_m == 2)).sum())
+        fp_pos = int(((yt_m != 2) & (yp_m == 2)).sum())
+        fn_pos = int(((yt_m == 2) & (yp_m != 2)).sum())
         prec_pos = tp_pos / (tp_pos + fp_pos) if (tp_pos + fp_pos) > 0 else 0.0
         rec_pos = tp_pos / (tp_pos + fn_pos) if (tp_pos + fn_pos) > 0 else 0.0
         f1_pos = 2 * prec_pos * rec_pos / (prec_pos + rec_pos) if (prec_pos + rec_pos) > 0 else 0.0
-
-        # Negative class (0) metrics
-        tp_neg = int(((yt == 0) & (yp == 0)).sum())
-        fp_neg = int(((yt != 0) & (yp == 0)).sum())
-        fn_neg = int(((yt == 0) & (yp != 0)).sum())
-
+        tp_neg = int(((yt_m == 0) & (yp_m == 0)).sum())
+        fp_neg = int(((yt_m != 0) & (yp_m == 0)).sum())
+        fn_neg = int(((yt_m == 0) & (yp_m != 0)).sum())
         prec_neg = tp_neg / (tp_neg + fp_neg) if (tp_neg + fp_neg) > 0 else 0.0
         rec_neg = tp_neg / (tp_neg + fn_neg) if (tp_neg + fn_neg) > 0 else 0.0
         f1_neg = 2 * prec_neg * rec_neg / (prec_neg + rec_neg) if (prec_neg + rec_neg) > 0 else 0.0
-
-        # Macro F1
-        f1_macro = (f1_pos + f1_neg) / 2.0
-
-        metrics[method] = {
-            "f1_macro": round(f1_macro, 4),
+        return {
+            "f1_macro": round((f1_pos + f1_neg) / 2, 4),
             "f1_positive": round(f1_pos, 4),
             "f1_negative": round(f1_neg, 4),
-            "precision_macro": round((prec_pos + prec_neg) / 2, 4),
-            "recall_macro": round((rec_pos + rec_neg) / 2, 4),
             "n_samples": int(mask.sum()),
         }
 
-    # Overall agreement rate (including neutrals)
-    total = len(merged)
-    if total > 0:
-        for method in ["vader", "lr"]:
-            col = f"score_{method}"
-            if col in merged.columns and method in metrics and "error" not in metrics[method]:
-                yp_all = to_binary(merged[col])
-                agreement = int((y_true == yp_all).sum())
-                metrics[method]["agreement_rate"] = round(agreement / total, 4)
+    # Compute all pairwise F1
+    methods = ["vader", "lr", "finbert"]
+    pairwise = {}
+    matrix = {}
+    for m1 in methods:
+        row = {}
+        for m2 in methods:
+            if m1 == m2:
+                row[m2] = {"f1_macro": 1.0}
+            elif f"{m2}_{m1}" in pairwise:
+                row[m2] = pairwise[f"{m2}_{m1}"]
+            else:
+                col1 = f"score_{m1}"
+                col2 = f"score_{m2}"
+                if col1 not in merged.columns or col2 not in merged.columns:
+                    row[m2] = {"error": "no_data"}
+                else:
+                    y1 = to_binary(merged[col1])
+                    y2 = to_binary(merged[col2])
+                    result = compute_pairwise_f1(y1, y2)
+                    pairwise[f"{m1}_{m2}"] = result
+                    row[m2] = result
+        matrix[m1] = row
 
-    return metrics
+    # Overall agreement rates (including neutrals)
+    total = len(merged)
+    agreement_rates = {}
+    for m1 in methods:
+        for m2 in methods:
+            if m1 >= m2:
+                continue
+            col1, col2 = f"score_{m1}", f"score_{m2}"
+            if col1 in merged.columns and col2 in merged.columns:
+                y1 = to_binary(merged[col1])
+                y2 = to_binary(merged[col2])
+                ag = int((y1 == y2).sum()) / total if total > 0 else 0.0
+                agreement_rates[f"{m1}_vs_{m2}"] = round(ag, 4)
+
+    # Average pairwise F1 (excluding self-comparisons)
+    f1_values = [v["f1_macro"] for k, v in pairwise.items() if "error" not in v]
+    avg_pairwise_f1 = round(float(np.mean(f1_values)), 4) if f1_values else None
+
+    return {
+        "pairwise_f1_matrix": matrix,
+        "pairwise_agreement_rates": agreement_rates,
+        "average_pairwise_f1": avg_pairwise_f1,
+        "n_dates": len(merged),
+        "note": "All metrics measure inter-method directional agreement, NOT accuracy. "
+                "No method is treated as ground truth.",
+    }
+
+
+def compute_news_quality(df: pd.DataFrame, ticker_col: str = "ticker",
+                         content_col: str = "cleaned_text",
+                         title_col: str = "title") -> dict:
+    """Detect template/duplicate news content and compute quality metrics per ticker.
+
+    Returns dict with per-ticker:
+      - uniqueness_ratio: fraction of articles with no near-duplicate (Jaccard > 0.7)
+      - template_ratio: fraction of articles matching common financial news templates
+      - short_content_ratio: fraction with <50 chars of content
+      - n_articles: total article count
+    """
+    if df.empty:
+        return {"per_ticker": {}, "global": {"uniqueness_ratio": 0.0, "n_articles": 0}}
+
+    # Common template patterns in financial news
+    TEMPLATE_PATTERNS = [
+        r'\{TICKER\}\s+(reports|announces|posts|beats|misses)',
+        r'(shares|stock)\s+(of\s+)?\{TICKER\}\s+(rose|fell|dipped|surged|plunged)',
+        r'(analysts|wall\s+street)\s+(upgrade|downgrade|rate)',
+        r'\{TICKER\}\s+(to\s+)?(buy|sell|hold)',
+    ]
+
+    import re as _re
+    per_ticker = {}
+
+    for ticker, group in df.groupby(ticker_col):
+        n = len(group)
+        if n < 2:
+            per_ticker[ticker] = {
+                "uniqueness_ratio": 1.0, "template_ratio": 0.0,
+                "short_content_ratio": 0.0, "n_articles": n,
+            }
+            continue
+
+        texts = group[content_col].fillna("").tolist()
+        titles = group[title_col].fillna("").tolist()
+
+        # Near-duplicate detection via Jaccard on word bigrams
+        def _bigrams(text: str) -> set:
+            words = str(text).lower().split()
+            return {f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)}
+
+        bigram_sets = [_bigrams(t) for t in texts]
+        dup_count = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                bi, bj = bigram_sets[i], bigram_sets[j]
+                union = len(bi | bj)
+                if union > 0:
+                    jaccard = len(bi & bj) / union
+                    if jaccard > 0.7:
+                        dup_count += 1
+                        break  # article i has at least one near-duplicate
+
+        uniqueness = 1.0 - dup_count / n if n > 0 else 1.0
+
+        # Template detection
+        template_count = 0
+        for t in titles + texts:
+            t_lower = str(t).lower()
+            for pattern in TEMPLATE_PATTERNS:
+                if _re.search(pattern.replace('{TICKER}', ticker.lower()), t_lower):
+                    template_count += 1
+                    break
+
+        template_ratio = min(template_count / (n * 2), 1.0)  # cap at 1.0
+
+        # Short content ratio
+        short_count = sum(1 for t in texts if len(str(t)) < 50)
+
+        per_ticker[ticker] = {
+            "uniqueness_ratio": round(uniqueness, 3),
+            "template_ratio": round(template_ratio, 3),
+            "short_content_ratio": round(short_count / n, 3) if n > 0 else 0.0,
+            "n_articles": n,
+        }
+
+    # Global summary
+    total_articles = sum(p["n_articles"] for p in per_ticker.values())
+    avg_uniqueness = (sum(p["uniqueness_ratio"] * p["n_articles"] for p in per_ticker.values())
+                      / max(total_articles, 1))
+    avg_template = (sum(p["template_ratio"] * p["n_articles"] for p in per_ticker.values())
+                    / max(total_articles, 1))
+    low_quality_tickers = [t for t, p in per_ticker.items()
+                           if p["uniqueness_ratio"] < 0.5 and p["n_articles"] >= 5]
+
+    return {
+        "per_ticker": per_ticker,
+        "global": {
+            "uniqueness_ratio": round(avg_uniqueness, 3),
+            "template_ratio": round(avg_template, 3),
+            "n_articles": total_articles,
+            "low_quality_tickers": low_quality_tickers,
+            "quality_warning": (
+                f"Low news quality for {len(low_quality_tickers)} tickers "
+                f"(uniqueness < 50%): {', '.join(low_quality_tickers[:5])}"
+                if low_quality_tickers else "News quality acceptable"
+            ),
+        },
+    }

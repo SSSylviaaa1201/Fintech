@@ -674,8 +674,12 @@ with main_col:
                 if len(seed_rewards) >= 2:
                     min_len = min(len(r) for r in seed_rewards)
                     seeds_matrix = np.array([r[:min_len] for r in seed_rewards])
+                    d0 = np.load(seed_files[0])
                     fig_conv = create_convergence_chart(
-                        seeds_matrix=seeds_matrix, ticker=f"{ticker} (with NLP)")
+                        seeds_matrix=seeds_matrix, ticker=f"{ticker} (with NLP)",
+                        plateau_converged=bool(d0.get("plateau_converged", False)),
+                        overfit_warning=bool(d0.get("overfit_warning", False)),
+                    )
                     st.plotly_chart(fig_conv, key="conv_multi",
                                     use_container_width=True, config={"displayModeBar": False})
             elif has_single:
@@ -684,7 +688,12 @@ with main_col:
                     rewards=conv_data["rewards"],
                     conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
                     slope=float(conv_data.get("slope", 0.0)),
-                    ticker=ticker)
+                    ticker=ticker,
+                    val_episodes=conv_data.get("val_episodes", np.array([])),
+                    val_rewards=conv_data.get("val_rewards", np.array([])),
+                    plateau_converged=bool(conv_data.get("plateau_converged", False)),
+                    overfit_warning=bool(conv_data.get("overfit_warning", False)),
+                )
                 st.plotly_chart(fig_conv, key="conv_single",
                                 use_container_width=True, config={"displayModeBar": False})
             elif has_legacy:
@@ -693,7 +702,12 @@ with main_col:
                     rewards=conv_data["rewards"],
                     conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
                     slope=float(conv_data.get("slope", 0.0)),
-                    ticker=ticker)
+                    ticker=ticker,
+                    val_episodes=conv_data.get("val_episodes", np.array([])),
+                    val_rewards=conv_data.get("val_rewards", np.array([])),
+                    plateau_converged=bool(conv_data.get("plateau_converged", False)),
+                    overfit_warning=bool(conv_data.get("overfit_warning", False)),
+                )
                 st.plotly_chart(fig_conv, key="conv_legacy",
                                 use_container_width=True, config={"displayModeBar": False})
         except Exception:
@@ -822,6 +836,7 @@ with side_col:
             neu = l1.get("nlp_neutral", 0)
             rate = l1.get("positive_rate", 0)
             mdd_imp = l1.get("nlp_mdd_improved", 0)
+            n_tickers = len(l1.get("tickers", {}))
 
             # Top performer by Sharpe delta
             tickers = l1.get("tickers", {})
@@ -835,16 +850,16 @@ with side_col:
             <div class="glass-card">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">NLP Positive (Sharpe)</span>
-                    <span style="color:#22c55e;font-weight:600;">{pos}/28 ({rate}%)</span></div>
+                    <span style="color:#22c55e;font-weight:600;">{pos}/{n_tickers} ({rate}%)</span></div>
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">NLP Neutral</span>
-                    <span style="color:#fbbf24;font-weight:600;">{neu}/28 ({round(neu/28*100,1)}%)</span></div>
+                    <span style="color:#fbbf24;font-weight:600;">{neu}/{n_tickers} ({round(neu/n_tickers*100,1)}%)</span></div>
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">NLP Negative</span>
-                    <span style="color:#ef4444;font-weight:600;">{neg}/28 ({round(neg/28*100,1)}%)</span></div>
+                    <span style="color:#ef4444;font-weight:600;">{neg}/{n_tickers} ({round(neg/n_tickers*100,1)}%)</span></div>
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">MDD Improved</span>
-                    <span style="color:#38bdf8;font-weight:600;">{mdd_imp}/28 ({round(mdd_imp/28*100,1)}%)</span></div>
+                    <span style="color:#38bdf8;font-weight:600;">{mdd_imp}/{n_tickers} ({round(mdd_imp/n_tickers*100,1)}%)</span></div>
                 <div style="display:flex;justify-content:space-between;">
                     <span class="label">Top Performer</span>
                     <span style="color:#38bdf8;font-weight:600;">{top_ticker or 'N/A'} Δ{top_delta:+.3f}</span></div>

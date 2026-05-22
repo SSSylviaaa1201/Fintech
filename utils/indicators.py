@@ -16,10 +16,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
+    avg_gain = gain.rolling(window=14, min_periods=14).mean()
+    avg_loss = loss.rolling(window=14, min_periods=14).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rs = rs.fillna(100.0)  # when avg_loss=0 (all up days), RSI → 100
+    # Distinguish: NaN from insufficient data vs NaN from all-up days
+    has_data = avg_gain.notna()  # True if >=14 valid deltas
+    all_up_days = has_data & rs.isna()  # avg_loss=0, RSI→100
+    rs[all_up_days] = 100.0
+    # For insufficient data, keep NaN then fill with neutral (50)
+    rs = rs.fillna(50.0)
     df["RSI"] = 100 - (100 / (1 + rs))
 
     # MACD

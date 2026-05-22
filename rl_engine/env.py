@@ -1,7 +1,8 @@
 """Custom Gym environment for financial trading with NLP sentiment signal.
 
 State vector (all normalized to roughly [-1, 1] or [0, 1]):
-  [price_ratio, MA50_ratio, MA200_ratio, RSI_norm, MACD_ratio, position_pct, cash_pct, sentiment]
+  [price_ratio, MA50_ratio, MA200_ratio, RSI_norm, MACD_ratio, position_pct,
+   cash_pct, sentiment, sentiment_ma5, sentiment_trend, sentiment_vol, sentiment_mask]
 
 Actions: 0=Hold, 1=Buy (25% of capital), 2=Sell (25% of position)
 """
@@ -14,11 +15,12 @@ import pandas as pd
 from gymnasium import spaces
 
 from config import (
-    SENTIMENT_ALIGNMENT_BONUS, MAX_DRAWDOWN_LIMIT, MAX_POSITION_PCT,
-    TRADE_FREQUENCY_PENALTY, CASH_PENALTY_RATE,
+    SENTIMENT_ALIGNMENT_SCALE, MAX_DRAWDOWN_LIMIT,
+    REWARD_TURNOVER_PENALTY,
+    HALF_SPREAD_BPS, SLIPPAGE_BPS_PER_PCT_VOL, MAX_VOLUME_FRACTION,
 )
 
-STATE_DIM = 11  # 8 base + sentiment_score + sentiment_ma5 + sentiment_trend + sentiment_vol
+STATE_DIM = 12  # 8 base + sentiment_score + sentiment_ma5 + sentiment_trend + sentiment_vol + sentiment_mask
 N_ACTIONS = 3
 
 
@@ -35,6 +37,8 @@ class FinancialTradingEnv(gym.Env):
         trade_fraction: float = 0.25,
         render_mode: Optional[str] = None,
         sentiment_bonus_enabled: bool = True,
+        alignment_scale: Optional[float] = None,
+        turnover_penalty: Optional[float] = None,
     ):
         super().__init__()
 
@@ -43,19 +47,27 @@ class FinancialTradingEnv(gym.Env):
         self.transaction_cost_pct = transaction_cost_pct
         self.trade_fraction = trade_fraction
         self.sentiment_bonus_enabled = sentiment_bonus_enabled
+        # Override config defaults if provided (for sensitivity analysis)
+        self.alignment_scale = alignment_scale if alignment_scale is not None else SENTIMENT_ALIGNMENT_SCALE
+        self.turnover_penalty = turnover_penalty if turnover_penalty is not None else REWARD_TURNOVER_PENALTY
 
         # Ensure required columns exist
-        required = ["close", "MA50", "MA200", "RSI", "MACD", "sentiment_score"]
+        required = ["close", "MA50", "MA200", "RSI", "MACD", "sentiment_score", "volume"]
         for col in required:
             if col not in self.df.columns:
                 self.df[col] = 0.0
-        for col in ["sentiment_ma5", "sentiment_trend", "sentiment_vol"]:
+        for col in ["sentiment_ma5", "sentiment_trend", "sentiment_vol", "sentiment_mask"]:
             if col not in self.df.columns:
                 self.df[col] = 0.0
 
         # Fill NaN values and precompute normalization constants
         self.df = self.df.ffill().fillna(0.0)
-        self._price_0 = float(self.df["close"].iloc[0]) if len(self.df) > 0 else 1.0
+
+        # Use provided price_baseline for consistent cross-split normalization
+        if "price_baseline" in self.df.columns and self.df["price_baseline"].iloc[0] > 0:
+            self._price_0 = float(self.df["price_baseline"].iloc[0])
+        else:
+            self._price_0 = float(self.df["close"].iloc[0]) if len(self.df) > 0 else 1.0
 
         self.n_steps = len(self.df)
         self.current_step = 0
@@ -109,6 +121,9 @@ class FinancialTradingEnv(gym.Env):
         sentiment_trend = float(row.get("sentiment_trend", 0.0))
         sentiment_vol = float(row.get("sentiment_vol", 0.0))
 
+        # Sentiment data availability flag (1=real data, 0=missing/forward-filled)
+        sentiment_mask = float(row.get("sentiment_mask", 0.0))
+
         state = np.array([
             price_ratio,
             ma50_ratio,
@@ -121,6 +136,7 @@ class FinancialTradingEnv(gym.Env):
             sentiment_ma5,
             sentiment_trend,
             sentiment_vol,
+            sentiment_mask,
         ], dtype=np.float32)
 
         return np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
@@ -146,65 +162,71 @@ class FinancialTradingEnv(gym.Env):
 
         self.prev_portfolio_value = self.portfolio_value
         trade_cost = 0.0
+        effective_price = price  # default for HOLD action
+
+        # Market friction: effective price adjusted for spread + slippage
+        volume = float(self.df.iloc[self.current_step].get("volume", 0))
+        daily_volume = max(volume, 100)  # fallback for zero-volume edge case
 
         if action == 1:  # Buy: use trade_fraction of cash
             cash_to_use = self.cash * self.trade_fraction
             if cash_to_use >= price:  # can buy at least 1 share
-                gross_shares = int(cash_to_use / price)
-                cost = price * gross_shares * (1 + self.transaction_cost_pct)
+                raw_shares = int(cash_to_use / price)
+                # Liquidity cap: can't trade >MAX_VOLUME_FRACTION of daily volume
+                max_shares = int(daily_volume * MAX_VOLUME_FRACTION)
+                gross_shares = min(raw_shares, max_shares)
+                # Effective buy price: close + half_spread + slippage
+                trade_pct_of_vol = gross_shares / daily_volume if daily_volume > 0 else 0.0
+                slippage_bps = SLIPPAGE_BPS_PER_PCT_VOL * trade_pct_of_vol * 100
+                effective_price = price * (1 + HALF_SPREAD_BPS / 10000 + slippage_bps / 10000)
+                cost = effective_price * gross_shares * (1 + self.transaction_cost_pct)
                 if cost <= self.cash:
                     self.shares += gross_shares
                     self.cash -= cost
-                    trade_cost = price * gross_shares * self.transaction_cost_pct
+                    trade_cost = effective_price * gross_shares * self.transaction_cost_pct + (effective_price - price) * gross_shares
 
         elif action == 2:  # Sell: sell trade_fraction of current shares
             if self.shares > 0:
-                shares_to_sell = max(1, int(self.shares * self.trade_fraction))
-                revenue = price * shares_to_sell * (1 - self.transaction_cost_pct)
+                raw_shares = max(1, int(self.shares * self.trade_fraction))
+                # Liquidity cap
+                max_shares = int(daily_volume * MAX_VOLUME_FRACTION)
+                shares_to_sell = min(raw_shares, max_shares)
+                # Effective sell price: close - half_spread - slippage
+                trade_pct_of_vol = shares_to_sell / daily_volume if daily_volume > 0 else 0.0
+                slippage_bps = SLIPPAGE_BPS_PER_PCT_VOL * trade_pct_of_vol * 100
+                effective_price = price * (1 - HALF_SPREAD_BPS / 10000 - slippage_bps / 10000)
+                revenue = effective_price * shares_to_sell * (1 - self.transaction_cost_pct)
                 self.shares -= shares_to_sell
                 self.cash += revenue
-                trade_cost = price * shares_to_sell * self.transaction_cost_pct
+                trade_cost = effective_price * shares_to_sell * self.transaction_cost_pct + (price - effective_price) * shares_to_sell
 
         # Update portfolio value
         self.portfolio_value = self.cash + self.shares * price
 
-        # Reward: percentage return (scale-invariant)
+        # Reward: percentage return (scale-invariant, primary signal)
         if self.prev_portfolio_value > 0:
             pct_return = (self.portfolio_value - self.prev_portfolio_value) / self.prev_portfolio_value
         else:
             pct_return = 0.0
 
-        # Cash holding penalty: proportional to idle cash fraction
+        reward = pct_return
+
+        # Portfolio state for auxiliary terms
         position_value = self.shares * price
         total = self.cash + position_value
-        idle_fraction = self.cash / total if total > 0 else 1.0
-        cash_penalty = -CASH_PENALTY_RATE * idle_fraction
 
-        # Position concentration penalty: discourage >MAX_POSITION_PCT in single stock
-        position_pct = position_value / total if total > 0 else 0.0
-        excess = position_pct - MAX_POSITION_PCT
-        concentration_penalty = -0.0005 * excess if excess > 0 else 0.0
-
-        # Trade frequency penalty: small cost per trade to discourage overtrading
-        made_trade = (action in (1, 2) and trade_cost > 0)
-        if made_trade:
-            self.trade_count += 1
-        frequency_penalty = -TRADE_FREQUENCY_PENALTY if made_trade else 0.0
-
-        # Sentiment-position alignment bonus (reward shaping)
+        # Sentiment-position alignment: continuous, no threshold
+        # Rewards holding when sentiment is positive, holding cash when negative
         sentiment = float(self.df.iloc[self.current_step].get("sentiment_score", 0.0))
-        sentiment_bonus = 0.0
-        if self.sentiment_bonus_enabled:
-            if sentiment > 0.3 and self.shares > 0:
-                sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
-            elif sentiment > 0.3 and self.shares == 0:
-                sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
-            elif sentiment < -0.3 and self.shares > 0:
-                sentiment_bonus = -SENTIMENT_ALIGNMENT_BONUS
-            elif sentiment < -0.3 and self.shares == 0:
-                sentiment_bonus = SENTIMENT_ALIGNMENT_BONUS
+        if self.sentiment_bonus_enabled and total > 0:
+            position_pct = position_value / total
+            sentiment_alignment = sentiment * position_pct * self.alignment_scale
+            reward += sentiment_alignment
 
-        reward = pct_return + cash_penalty + concentration_penalty + frequency_penalty + sentiment_bonus
+        # Turnover penalty: proportional to trade cost relative to portfolio
+        if trade_cost > 0 and total > 0:
+            self.trade_count += 1
+            reward -= self.turnover_penalty * (trade_cost / total)
 
         # Max drawdown tracking and early termination
         self.peak_value = max(self.peak_value, self.portfolio_value)
@@ -222,8 +244,9 @@ class FinancialTradingEnv(gym.Env):
             "shares": self.shares,
             "price": price,
             "trade_cost": trade_cost,
+            "effective_price": effective_price if action in (1, 2) and trade_cost > 0 else price,
             "pct_return": pct_return,
-            "sentiment_bonus": sentiment_bonus,
+            "sentiment_alignment": sentiment * (position_value / total) * self.alignment_scale if total > 0 else 0.0,
             "drawdown": drawdown,
             "trade_count": self.trade_count,
             "drawdown_terminated": drawdown_terminated,

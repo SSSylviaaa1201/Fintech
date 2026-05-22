@@ -211,13 +211,65 @@ def fetch_news_alphavantage(
     return all_records
 
 
+# Sector → industry keywords for news proxy fallback
+SECTOR_KEYWORDS = {
+    "Tech": ["technology sector", "tech stocks", "NASDAQ technology"],
+    "Finance": ["banking sector", "financial services", "S&P 500 financials"],
+    "Healthcare": ["healthcare sector", "biotech stocks", "pharmaceutical industry"],
+    "Consumer": ["consumer staples", "retail sector", "consumer discretionary"],
+    "Energy/Industrial": ["energy sector", "industrial stocks", "oil and gas industry"],
+    "Comm/Utility": ["telecom sector", "utilities sector", "communication services"],
+}
+
+# Ticker → sector mapping (mirrors main.py for news proxy)
+TICKER_SECTOR = {}
+_ticker_sector_data = [
+    (["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "ADBE", "INTC", "CRM"], "Tech"),
+    (["JPM", "BAC", "V", "MA", "GS", "BLK", "AXP", "MS", "WFC", "C"], "Finance"),
+    (["JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "BMY", "GILD", "LLY"], "Healthcare"),
+    (["KO", "PEP", "WMT", "COST", "NKE", "HD", "MCD", "PG", "SBUX", "LOW"], "Consumer"),
+    (["XOM", "CVX", "CAT", "BA", "GE", "COP", "DE", "UPS", "LMT", "RTX"], "Energy/Industrial"),
+    (["DIS", "NFLX", "NEE", "T", "VZ", "CMCSA", "TMUS", "SO", "DUK", "CHTR"], "Comm/Utility"),
+]
+for _tickers, _sector in _ticker_sector_data:
+    for _t in _tickers:
+        TICKER_SECTOR[_t] = _sector
+
+
+def _fetch_sector_news_proxy(ticker: str) -> list[dict]:
+    """Step 5 fallback: fetch news using sector keywords when stock-specific news is unavailable.
+
+    Uses RSS feeds with sector-level search terms, tagged as industry_proxy=True.
+    """
+    sector = TICKER_SECTOR.get(ticker, "General")
+    keywords = SECTOR_KEYWORDS.get(sector, ["stock market", "Wall Street"])
+
+    all_records = []
+    from data_ingestion.rss_fetcher import fetch_news_rss
+    for keyword in keywords[:2]:  # limit to 2 keywords to stay within rate limits
+        try:
+            records = fetch_news_rss(keyword, max_per_source=5)
+            for r in records:
+                r["ticker"] = ticker
+                r["is_industry_proxy"] = True
+                r["proxy_sector"] = sector
+            all_records.extend(records)
+        except Exception:
+            continue
+
+    logger.info("Sector proxy (%s → %s): %d articles for %s",
+                sector, keywords[0], len(all_records), ticker)
+    return all_records
+
+
 def fetch_news_for_all_tickers(
     tickers: Optional[list[str]] = None,
 ) -> tuple[list[dict], list[str]]:
-    """Fetch news for all tickers. Fallback chain: Finnhub → Alpha Vantage → NewsAPI → RSS → sample."""
+    """Fetch news for all tickers. Fallback chain: Finnhub → AlphaVantage → NewsAPI → RSS → sector proxy."""
     tickers = tickers or TICKERS
     all_records = []
     failed = []
+    proxy_tickers = []
 
     for t in tickers:
         # 1) Finnhub (fast, 60 calls/min, ~12 months lookback)
@@ -228,7 +280,7 @@ def fetch_news_for_all_tickers(
             continue
 
         # 2) Alpha Vantage News (25 calls/day, deeper history)
-        logger.info("Finnhub exhausted, trying Alpha Vantage news for %s...", t)
+        logger.info("Finnhub exhausted, trying AlphaVantage news for %s...", t)
         records = fetch_news_alphavantage(t)
         if records:
             all_records.extend(records)
@@ -248,9 +300,22 @@ def fetch_news_for_all_tickers(
         if records:
             all_records.extend(records)
             logger.info("RSS: %d articles for %s", len(records), t)
+            continue
+
+        # 5) Industry-level news proxy
+        logger.info("All stock sources failed, trying sector-level proxy for %s...", t)
+        records = _fetch_sector_news_proxy(t)
+        if records:
+            all_records.extend(records)
+            proxy_tickers.append(t)
+            logger.info("Sector proxy: %d articles for %s", len(records), t)
         else:
             failed.append(t)
-            logger.warning("All sources failed for %s", t)
+            logger.warning("All sources (incl. sector proxy) failed for %s", t)
+
+    if proxy_tickers:
+        logger.info("Used industry-level news proxy for %d tickers: %s",
+                    len(proxy_tickers), ", ".join(proxy_tickers))
 
     return all_records, failed
 

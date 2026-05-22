@@ -96,7 +96,7 @@ def create_candlestick_chart(market_df: pd.DataFrame, trades_df=None) -> go.Figu
 
 
 def create_sentiment_quad(sentiment_df: pd.DataFrame) -> go.Figure:
-    """Four-method sentiment overlay chart."""
+    """Multi-method sentiment overlay chart with daily noise + smoothed trend."""
     fig = go.Figure()
     method_cfg = {
         "vader": {"color": COLORS["vader"], "dash": "solid"},
@@ -105,8 +105,26 @@ def create_sentiment_quad(sentiment_df: pd.DataFrame) -> go.Figure:
         "llm": {"color": COLORS["llm"], "dash": "longdash"},
     }
     for method, cfg in method_cfg.items():
-        sub = sentiment_df[sentiment_df["method"] == method]
-        if not sub.empty:
+        sub = sentiment_df[sentiment_df["method"] == method].sort_values("date")
+        if sub.empty:
+            continue
+        # Daily scatter: show true noise (no connecting lines)
+        fig.add_trace(go.Scatter(
+            x=sub["date"], y=sub["sentiment_score"],
+            mode="markers", name=f"{method.upper()} daily",
+            marker=dict(color=cfg["color"], size=4, opacity=0.35),
+            showlegend=False,
+        ))
+        # 7-day rolling mean overlay: reveal trend direction
+        if len(sub) >= 7:
+            sub_ma = sub.copy()
+            sub_ma["sentiment_ma7"] = sub_ma["sentiment_score"].rolling(7, min_periods=1).mean()
+            fig.add_trace(go.Scatter(
+                x=sub_ma["date"], y=sub_ma["sentiment_ma7"],
+                mode="lines", name=method.upper(),
+                line=dict(color=cfg["color"], width=2.0, dash=cfg["dash"]),
+            ))
+        else:
             fig.add_trace(go.Scatter(
                 x=sub["date"], y=sub["sentiment_score"],
                 mode="lines+markers", name=method.upper(),
@@ -116,7 +134,12 @@ def create_sentiment_quad(sentiment_df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.4)
     fig.add_hrect(y0=0.05, y1=1.0, fillcolor="rgba(239,68,68,0.04)", line_width=0)
     fig.add_hrect(y0=-1.0, y1=-0.05, fillcolor="rgba(34,197,94,0.04)", line_width=0)
-    fig.update_layout(template=DARK_TEMPLATE, height=280, yaxis=dict(range=[-1.1, 1.1], title="Sentiment Score"), legend=dict(orientation="h"))
+    fig.update_layout(
+        template=DARK_TEMPLATE, height=300,
+        yaxis=dict(range=[-1.1, 1.1], title="Sentiment Score"),
+        legend=dict(orientation="h"),
+        title=dict(text="Daily scores (markers) + 7-day MA trend (lines)", font=dict(size=11, color=COLORS["muted"])),
+    )
     return fig
 
 
@@ -164,12 +187,19 @@ def create_heatmap(returns_dict: dict) -> go.Figure:
 def create_convergence_chart(rewards: np.ndarray = None,
                               conv_ratio: float = 0.0, slope: float = 0.0,
                               ticker: str = "",
-                              seeds_matrix: np.ndarray = None) -> go.Figure:
-    """DQN training convergence: episode reward with optional multi-seed shading.
+                              seeds_matrix: np.ndarray = None,
+                              val_episodes: np.ndarray = None,
+                              val_rewards: np.ndarray = None,
+                              plateau_converged: bool = False,
+                              overfit_warning: bool = False) -> go.Figure:
+    """DQN training convergence with validation overlay and diagnostics.
 
     Args:
         rewards: Single-seed reward array (legacy).
         seeds_matrix: shape (n_seeds, n_episodes) for shaded mean±std plot.
+        val_episodes, val_rewards: Validation reward data for overfitting detection.
+        plateau_converged: Whether tail CV and slope indicate convergence.
+        overfit_warning: Whether train/val divergence was detected.
     """
     fig = go.Figure()
 
@@ -228,13 +258,30 @@ def create_convergence_chart(rewards: np.ndarray = None,
             line=dict(color=COLORS["muted"], width=1.5, dash="dash"),
         ))
         title = f"Convergence — {ticker}" if ticker else "Convergence"
+
+        # Overlay validation rewards if available
+        if val_episodes is not None and val_rewards is not None and len(val_episodes) > 0:
+            fig.add_trace(go.Scatter(
+                x=val_episodes, y=val_rewards,
+                mode="markers+lines", name="Val Reward",
+                line=dict(color=COLORS["lr"], width=1.5),
+                marker=dict(size=5, color=COLORS["lr"], symbol="diamond"),
+            ))
     else:
         return fig
 
+    # Diagnostic annotation
+    diag_parts = [f"ratio={conv_ratio:.2f}", f"slope={slope:+.4f}"]
+    if plateau_converged:
+        diag_parts.append("✓ Converged")
+    if overfit_warning:
+        diag_parts.append("⚠ Overfit")
+    diag_text = " · ".join(diag_parts)
+
     fig.update_layout(
-        template=DARK_TEMPLATE, height=280,
-        title=dict(text=f"{title}  ·  ratio={conv_ratio:.2f}  slope={slope:+.4f}",
-                   font=dict(size=11, color=COLORS["muted"])),
+        template=DARK_TEMPLATE, height=300,
+        title=dict(text=f"{title}  ·  {diag_text}",
+                   font=dict(size=11, color=COLORS["lr"] if overfit_warning else COLORS["muted"])),
         xaxis_title="Episode", yaxis_title="Reward",
         legend=dict(orientation="h", yanchor="top", y=-0.18),
         margin=dict(l=20, r=20, t=35, b=30),

@@ -55,6 +55,25 @@ class DatabaseManager:
                 params=(ticker, limit),
             )
 
+    def get_news_stratified(self, ticker: str, per_year: int = 50) -> pd.DataFrame:
+        """Sample news evenly across years to avoid recency bias.
+
+        Uses SQLite window functions to select up to per_year articles per year,
+        providing balanced coverage across the full date range.
+        """
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY strftime('%Y', published_at) ORDER BY published_at DESC
+                    ) as rn
+                    FROM news WHERE ticker=?
+                ) WHERE rn <= ?
+                ORDER BY published_at DESC""",
+                conn,
+                params=(ticker, per_year),
+            )
+
     # ── Market Data ───────────────────────────────────────────────────
 
     def insert_market_data(self, ticker: str, df: pd.DataFrame) -> int:

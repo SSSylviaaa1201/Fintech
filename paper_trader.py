@@ -141,6 +141,7 @@ class PaperTrader:
             float(row.get("sentiment_ma5", 0.0)),
             float(row.get("sentiment_trend", 0.0)),
             float(row.get("sentiment_vol", 0.0)),
+            float(row.get("sentiment_mask", 0.0)),
         ], dtype=np.float32)
 
         state = np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)

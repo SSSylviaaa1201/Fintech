@@ -650,70 +650,29 @@ with main_col:
             except Exception:
                 st.caption("Drawdown chart unavailable")
 
-    # Row 5: Convergence plot
-    curves_dir = Path(DATA_DIR) / "training_curves"
-    # Prefer multi-seed (ablation) data: {ticker}_seed*_with_nlp_rewards.npz
-    seed_files = sorted(curves_dir.glob(f"{ticker}_seed*_with_nlp_rewards.npz")) if curves_dir.exists() else []
-    single_file = curves_dir / f"{ticker}_rewards.npz" if curves_dir.exists() else None
-    legacy_file = curves_dir / "rewards.npz" if curves_dir.exists() else None
-
-    has_multi = len(seed_files) >= 2
-    has_single = single_file.exists() if single_file else False
-    has_legacy = legacy_file.exists() if legacy_file else False
-
-    # Training curves are only available when explicitly saved (not in ablation mode).
-    # Ablation results are displayed via the ablation summary table instead.
-    if has_multi or has_single or has_legacy:
-        st.markdown('<p class="section-header">Convergence</p>', unsafe_allow_html=True)
+    # Row 5: Ablation insight for this ticker
+    ablation_json = Path(__file__).parent.parent / "data" / "ablation_results.json"
+    if ablation_json.exists():
         try:
-            if has_multi:
-                # Load all seeds and stack into matrix
-                seed_rewards = []
-                for sf in seed_files:
-                    d = np.load(sf)
-                    if "rewards" in d:
-                        seed_rewards.append(d["rewards"])
-                if len(seed_rewards) >= 2:
-                    min_len = min(len(r) for r in seed_rewards)
-                    seeds_matrix = np.array([r[:min_len] for r in seed_rewards])
-                    d0 = np.load(seed_files[0])
-                    fig_conv = create_convergence_chart(
-                        seeds_matrix=seeds_matrix, ticker=f"{ticker} (with NLP)",
-                        plateau_converged=bool(d0.get("plateau_converged", False)),
-                        overfit_warning=bool(d0.get("overfit_warning", False)),
-                    )
-                    st.plotly_chart(fig_conv, key="conv_multi",
-                                    use_container_width=True, config={"displayModeBar": False})
-            elif has_single:
-                conv_data = np.load(single_file)
-                fig_conv = create_convergence_chart(
-                    rewards=conv_data["rewards"],
-                    conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
-                    slope=float(conv_data.get("slope", 0.0)),
-                    ticker=ticker,
-                    val_episodes=conv_data.get("val_episodes", np.array([])),
-                    val_rewards=conv_data.get("val_rewards", np.array([])),
-                    plateau_converged=bool(conv_data.get("plateau_converged", False)),
-                    overfit_warning=bool(conv_data.get("overfit_warning", False)),
-                )
-                st.plotly_chart(fig_conv, key="conv_single",
-                                use_container_width=True, config={"displayModeBar": False})
-            elif has_legacy:
-                conv_data = np.load(legacy_file)
-                fig_conv = create_convergence_chart(
-                    rewards=conv_data["rewards"],
-                    conv_ratio=float(conv_data.get("conv_ratio", 0.0)),
-                    slope=float(conv_data.get("slope", 0.0)),
-                    ticker=ticker,
-                    val_episodes=conv_data.get("val_episodes", np.array([])),
-                    val_rewards=conv_data.get("val_rewards", np.array([])),
-                    plateau_converged=bool(conv_data.get("plateau_converged", False)),
-                    overfit_warning=bool(conv_data.get("overfit_warning", False)),
-                )
-                st.plotly_chart(fig_conv, key="conv_legacy",
-                                use_container_width=True, config={"displayModeBar": False})
+            import json
+            ablation_data = json.loads(ablation_json.read_text(encoding="utf-8"))
+            ticker_info = ablation_data.get("layer1_ablation", {}).get("tickers", {}).get(ticker)
+            if ticker_info:
+                delta = ticker_info.get("sharpe_delta", 0)
+                helps = ticker_info.get("nlp_improves_sharpe", False)
+                delta_std = ticker_info.get("sharpe_delta_std", 0)
+                clr = COLORS["up"] if helps else COLORS["down"]
+                emoji = "&#9650;" if helps else "&#9660;"
+                st.markdown(f"""
+                <div class="glass-card" style="margin-top:12px;">
+                    <div style="display:flex;justify-content:space-between;">
+                        <span class="label">NLP Contribution ({ticker})</span>
+                        <span style="color:{clr};font-weight:700;">{emoji} Sharpe &Delta;={delta:+.3f} &plusmn;{delta_std:.3f}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
         except Exception:
-            st.caption("Convergence plot unavailable")
+            pass
 
     # Row 6: Market returns heatmap (tickers × days)
     st.markdown('<p class="section-header">Market Heatmap</p>', unsafe_allow_html=True)
@@ -809,17 +768,17 @@ with side_col:
             recent = orders_sorted.tail(5)[["ticker", "date", "action", "shares", "price"]]
             st.dataframe(recent, hide_index=True, use_container_width=True)
         else:
-            st.caption("No paper trades yet. Train a model first.")
-            if st.button("Run Paper Trading Cycle", use_container_width=True):
-                with st.spinner("Running..."):
+            st.caption("No paper trades yet. Train a model first (`python main.py`).")
+            if st.button("Run Paper Trading", use_container_width=True):
+                with st.spinner("Running paper trading cycle..."):
                     try:
                         from paper_trader import run_paper_trading_cycle
                         summary = run_paper_trading_cycle(db)
-                        st.success(f"Done! Equity: ${summary['total_equity']:,.2f}")
+                        st.success(f"Equity: ${summary['total_equity']:,.2f}, PnL: {summary.get('total_pnl_pct',0):+.1f}%")
                     except FileNotFoundError:
-                        st.error("No trained model found. Run `python main.py` first.")
+                        st.error("No trained model. Run: `python main.py`")
                     except Exception as exc:
-                        st.error(f"Failed: {exc}")
+                        st.error(f"Error: {exc}")
                 st.rerun()
     except Exception as exc:
         st.caption(f"Paper trading unavailable: {exc}")
@@ -833,6 +792,7 @@ with side_col:
         try:
             ablation_data = json.loads(ablation_json.read_text(encoding="utf-8"))
             l1 = ablation_data.get("layer1_ablation", {})
+            l2 = ablation_data.get("layer2_dqn_vs_bh", {})
             pos = l1.get("nlp_positive", 0)
             neg = l1.get("nlp_negative", 0)
             neu = l1.get("nlp_neutral", 0)
@@ -840,38 +800,85 @@ with side_col:
             mdd_imp = l1.get("nlp_mdd_improved", 0)
             n_tickers = len(l1.get("tickers", {}))
 
-            # Top performer by Sharpe delta
-            tickers = l1.get("tickers", {})
-            top_ticker, top_delta, top_mdd_delta = None, -999, 0
-            for t, s in tickers.items():
-                d = s.get("sharpe_delta", 0)
-                if d > top_delta:
-                    top_delta, top_ticker, top_mdd_delta = d, t, s.get("mdd_delta", 0)
-
             st.markdown(f"""
             <div class="glass-card">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                    <span class="label">NLP Positive (Sharpe)</span>
+                    <span class="label">NLP Positive (Sharpe &Delta;)</span>
                     <span style="color:#22c55e;font-weight:600;">{pos}/{n_tickers} ({rate}%)</span></div>
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">NLP Neutral</span>
-                    <span style="color:#fbbf24;font-weight:600;">{neu}/{n_tickers} ({round(neu/n_tickers*100,1)}%)</span></div>
+                    <span style="color:#fbbf24;font-weight:600;">{neu}/{n_tickers}</span></div>
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                     <span class="label">NLP Negative</span>
-                    <span style="color:#ef4444;font-weight:600;">{neg}/{n_tickers} ({round(neg/n_tickers*100,1)}%)</span></div>
-                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                    <span class="label">MDD Improved</span>
-                    <span style="color:#38bdf8;font-weight:600;">{mdd_imp}/{n_tickers} ({round(mdd_imp/n_tickers*100,1)}%)</span></div>
+                    <span style="color:#ef4444;font-weight:600;">{neg}/{n_tickers}</span></div>
                 <div style="display:flex;justify-content:space-between;">
-                    <span class="label">Top Performer</span>
-                    <span style="color:#38bdf8;font-weight:600;">{top_ticker or 'N/A'} Δ{top_delta:+.3f}</span></div>
+                    <span class="label">MDD Improved by NLP</span>
+                    <span style="color:#38bdf8;font-weight:600;">{mdd_imp}/{n_tickers}</span></div>
             </div>
             """, unsafe_allow_html=True)
-            st.caption(f"Source: data/ablation_results.json  ·  {ablation_data.get('timestamp','')[:16]}")
+
+            # Per-sector table
+            st.caption("By Sector")
+            sectors = {
+                "Tech": [], "Finance": [], "Healthcare": [],
+                "Consumer": [], "Energy/Ind": [], "Comm/Util": [],
+            }
+            sector_map = dict(zip(
+                ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','ADBE','INTC','CRM',
+                 'JPM','BAC','V','MA','GS','BLK','AXP','MS','WFC','C',
+                 'JNJ','UNH','PFE','ABBV','MRK','TMO','ABT','BMY','GILD','LLY',
+                 'KO','PEP','WMT','COST','NKE','HD','MCD','PG','SBUX','LOW',
+                 'XOM','CVX','CAT','BA','GE','COP','DE','UPS','LMT','RTX',
+                 'DIS','NFLX','NEE','T','VZ','CMCSA','TMUS','SO','DUK','CHTR'],
+                ["Tech"]*10 + ["Finance"]*10 + ["Healthcare"]*10 +
+                ["Consumer"]*10 + ["Energy/Ind"]*10 + ["Comm/Util"]*10))
+            tickers = l1.get("tickers", {})
+            for t, s in tickers.items():
+                sec = sector_map.get(t, "Other")
+                if sec in sectors:
+                    sectors[sec].append((t, s["sharpe_delta"], s["nlp_improves_sharpe"]))
+
+            rows_data = []
+            for sec, stocks in sectors.items():
+                if not stocks:
+                    continue
+                pos_n = sum(1 for _, _, h in stocks if h)
+                avg_d = sum(d for _, d, _ in stocks) / len(stocks)
+                dots = " ".join(
+                    f'<span style="color:{"#22c55e" if h else "#ef4444"};font-size:14px;">{"&#9679;" if h else "&#9675;"}</span>'
+                    for _, _, h in stocks
+                )
+                rows_data.append((sec, f"{pos_n}/{len(stocks)}", f"{avg_d:+.3f}", dots))
+
+            if rows_data:
+                df_sec = pd.DataFrame(rows_data, columns=["Sector", "NLP+", "Avg &Delta;", "Per Ticker"])
+                st.markdown(
+                    df_sec.to_html(escape=False, index=False, justify="left"),
+                    unsafe_allow_html=True,
+                )
+
+            # DQN vs B&H
+            if l2:
+                dqn_win = l2.get("sharpe_win_rate", 0)
+                st_tests = l2.get("statistical_tests", {})
+                bt = st_tests.get("binomial_test_sharpe", {})
+                tt = st_tests.get("paired_t_test", {})
+                st.markdown(f"""
+                <div class="glass-card" style="margin-top:12px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span class="label">DQN &gt; B&amp;H (Sharpe)</span>
+                        <span style="color:#fbbf24;font-weight:600;">{dqn_win}%</span></div>
+                    <div style="display:flex;justify-content:space-between;">
+                        <span class="label">Paired t-test (DQN vs BH)</span>
+                        <span style="color:{"#ef4444" if tt.get("cohens_d",0)<0 else "#22c55e"};font-weight:600;">
+                            p={tt.get("p_value",1):.4f} d={tt.get("cohens_d",0):+.3f}</span></div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.caption(f"60-stock ablation  ·  {ablation_data.get('timestamp','')[:16]}")
+
         except Exception:
             st.caption("Could not read ablation results.")
-    elif has_logs:
-        st.info(f"{len(logs_df):,} training log entries available.")
     else:
         st.caption("No ablation data yet. Run: `python main.py --ablate`")
 
